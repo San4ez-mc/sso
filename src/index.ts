@@ -6,6 +6,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { PrismaClient } from '@prisma/client';
+import { smtpEnabled, sendResetEmail } from './mailer';
 
 const prisma = new PrismaClient();
 const app = express();
@@ -117,7 +118,17 @@ app.post('/forgot-password', async (req: Request, res: Response) => {
       const link = `${BASE_URL}/reset-password/${token}`;
       // eslint-disable-next-line no-console
       console.log('[sso forgot-password]', email, '->', link);
-      if (!process.env.SMTP_HOST) devLink = link; // без SMTP — віддаємо лінк
+      if (smtpEnabled()) {
+        try {
+          await sendResetEmail(email, link);
+        } catch (mailErr) {
+          // eslint-disable-next-line no-console
+          console.error('[sso forgot-password] SMTP помилка:', mailErr);
+          // Лист не пішов — не розкриваємо помилку клієнту; лінк лишається в логах.
+        }
+      } else {
+        devLink = link; // без SMTP (локально) — віддаємо лінк у відповіді
+      }
     }
     res.json({ ok: true, message: 'Якщо акаунт існує, ми надіслали посилання для скидання.', ...(devLink ? { devLink } : {}) });
   } catch (err) {
