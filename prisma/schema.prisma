@@ -1,0 +1,76 @@
+// SSO FINEKO — схема (#284). Ідентичність (ХТО); доступи дає орг.структура (ЩО).
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String? // null якщо лише через провайдера (Google тощо)
+  displayName  String?
+  status       String    @default("active") // active | disabled
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  identities  Identity[]
+  resetTokens PasswordResetToken[]
+
+  @@map("users")
+}
+
+// Кілька способів входу на одного User (мердж за email)
+model Identity {
+  id             String   @id @default(uuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider       String // password | google | microsoft | apple | telegram
+  providerUserId String
+  email          String?
+  createdAt      DateTime @default(now())
+
+  @@unique([provider, providerUserId])
+  @@index([userId])
+  @@map("identities")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@map("password_reset_tokens")
+}
+
+// OAuth-клієнти (наші продукти: content2, орг, трекер)
+model OAuthClient {
+  id           String   @id @default(uuid())
+  clientId     String   @unique
+  clientSecret String
+  name         String
+  redirectUris String // JSON-масив дозволених redirect_uri
+  createdAt    DateTime @default(now())
+
+  @@map("oauth_clients")
+}
+
+// Разові коди authorization_code flow
+model AuthCode {
+  code        String   @id
+  clientId    String
+  userId      String
+  redirectUri String
+  expiresAt   DateTime
+  used        Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@map("auth_codes")
+}
