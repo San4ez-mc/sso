@@ -10,6 +10,7 @@ import { PrismaClient } from '@prisma/client';
 const prisma = new PrismaClient();
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // форми логіну + OAuth token-запит (NextAuth шле form-urlencoded)
 app.use(cookieParser());
 app.use(cors({ origin: true, credentials: true }));
 
@@ -145,40 +146,50 @@ app.post('/reset-password', async (req: Request, res: Response) => {
 // Продукт: redirect на /authorize?client_id&redirect_uri&state
 // Після входу SSO віддає ?code; продукт міняє code→token на /oauth/token.
 app.get('/authorize', async (req: Request, res: Response) => {
-  const clientId = String(req.query.client_id || '');
-  const redirectUri = String(req.query.redirect_uri || '');
-  const state = String(req.query.state || '');
-  const client = await prisma.oAuthClient.findUnique({ where: { clientId } });
-  if (!client) return void res.status(400).send('Unknown client_id');
-  const allowed: string[] = JSON.parse(client.redirectUris || '[]');
-  if (allowed.length && !allowed.includes(redirectUri)) return void res.status(400).send('redirect_uri not allowed');
+  try {
+    const clientId = String(req.query.client_id || '');
+    const redirectUri = String(req.query.redirect_uri || '');
+    const state = String(req.query.state || '');
+    if (!clientId) return void res.status(400).send('client_id required');
+    const client = await prisma.oAuthClient.findUnique({ where: { clientId } });
+    if (!client) return void res.status(400).send('Unknown client_id');
+    const allowed: string[] = JSON.parse(client.redirectUris || '[]');
+    if (allowed.length && !allowed.includes(redirectUri)) return void res.status(400).send('redirect_uri not allowed');
 
-  // Якщо вже є активна сесія SSO — одразу видаємо код
-  const user = await currentUser(req);
-  if (user) {
-    const code = randomBytes(24).toString('hex');
-    await prisma.authCode.create({ data: { code, clientId, userId: user.id, redirectUri, expiresAt: new Date(Date.now() + 300_000) } });
-    const sep = redirectUri.includes('?') ? '&' : '?';
-    return void res.redirect(`${redirectUri}${sep}code=${code}${state ? `&state=${encodeURIComponent(state)}` : ''}`);
+    // Якщо вже є активна сесія SSO — одразу видаємо код
+    const user = await currentUser(req);
+    if (user) {
+      const code = randomBytes(24).toString('hex');
+      await prisma.authCode.create({ data: { code, clientId, userId: user.id, redirectUri, expiresAt: new Date(Date.now() + 300_000) } });
+      const sep = redirectUri.includes('?') ? '&' : '?';
+      return void res.redirect(`${redirectUri}${sep}code=${code}${state ? `&state=${encodeURIComponent(state)}` : ''}`);
+    }
+    // Інакше — форма входу
+    res.type('html').send(loginPage(clientId, redirectUri, state, ''));
+  } catch (err) {
+    res.status(500).send('SSO error: ' + String(err));
   }
-  // Інакше — форма входу
-  res.type('html').send(loginPage(clientId, redirectUri, state, ''));
 });
 
 app.post('/authorize', async (req: Request, res: Response) => {
-  const { client_id: clientId, redirect_uri: redirectUri, state = '', email, password } = req.body || {};
-  const client = await prisma.oAuthClient.findUnique({ where: { clientId } });
-  if (!client) return void res.status(400).send('Unknown client_id');
-  const user = await prisma.user.findUnique({ where: { email: String(email || '').trim().toLowerCase() } });
-  if (!user || !user.passwordHash || !(await bcrypt.compare(String(password || ''), user.passwordHash)) || user.status !== 'active') {
-    return void res.type('html').send(loginPage(clientId, redirectUri, state, 'Невірний email або пароль'));
+  try {
+    const { client_id: clientId, redirect_uri: redirectUri, state = '', email, password } = req.body || {};
+    if (!clientId) return void res.status(400).send('client_id required');
+    const client = await prisma.oAuthClient.findUnique({ where: { clientId } });
+    if (!client) return void res.status(400).send('Unknown client_id');
+    const user = await prisma.user.findUnique({ where: { email: String(email || '').trim().toLowerCase() } });
+    if (!user || !user.passwordHash || !(await bcrypt.compare(String(password || ''), user.passwordHash)) || user.status !== 'active') {
+      return void res.type('html').send(loginPage(clientId, redirectUri, state, 'Невірний email або пароль'));
+    }
+    const token = issueToken(user);
+    res.cookie('sso_token', token, { httpOnly: true, sameSite: 'lax', maxAge: TOKEN_TTL * 1000 });
+    const code = randomBytes(24).toString('hex');
+    await prisma.authCode.create({ data: { code, clientId, userId: user.id, redirectUri, expiresAt: new Date(Date.now() + 300_000) } });
+    const sep = redirectUri.includes('?') ? '&' : '?';
+    res.redirect(`${redirectUri}${sep}code=${code}${state ? `&state=${encodeURIComponent(state)}` : ''}`);
+  } catch (err) {
+    res.status(500).send('SSO error: ' + String(err));
   }
-  const token = issueToken(user);
-  res.cookie('sso_token', token, { httpOnly: true, sameSite: 'lax', maxAge: TOKEN_TTL * 1000 });
-  const code = randomBytes(24).toString('hex');
-  await prisma.authCode.create({ data: { code, clientId, userId: user.id, redirectUri, expiresAt: new Date(Date.now() + 300_000) } });
-  const sep = redirectUri.includes('?') ? '&' : '?';
-  res.redirect(`${redirectUri}${sep}code=${code}${state ? `&state=${encodeURIComponent(state)}` : ''}`);
 });
 
 app.post('/oauth/token', async (req: Request, res: Response) => {
@@ -262,6 +273,16 @@ ${error ? `<div class="err">${esc(error)}</div>` : ''}
 <input name="password" type="password" placeholder="пароль" required>
 <button type="submit">Увійти</button></form></div></body></html>`;
 }
+
+// Захист: жоден необроблений reject/exception не має класти сервіс
+process.on('unhandledRejection', (reason) => {
+  // eslint-disable-next-line no-console
+  console.error('[fineko-sso] unhandledRejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  // eslint-disable-next-line no-console
+  console.error('[fineko-sso] uncaughtException:', err);
+});
 
 app.listen(PORT, () => {
   // eslint-disable-next-line no-console
