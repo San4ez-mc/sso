@@ -153,6 +153,10 @@ app.post('/reset-password', async (req: Request, res: Response) => {
   }
 });
 
+// HTML-сторінки відновлення (форма → наявні JSON POST /forgot-password, /reset-password)
+app.get('/forgot-password', (_req, res) => void res.type('html').send(forgotPage()));
+app.get('/reset-password/:token', (req, res) => void res.type('html').send(resetPage(String(req.params.token || ''))));
+
 // ── OAuth authorization_code flow (для підключення продуктів) ──
 // Продукт: redirect на /authorize?client_id&redirect_uri&state
 // Після входу SSO віддає ?code; продукт міняє code→token на /oauth/token.
@@ -280,9 +284,58 @@ button{width:100%;padding:11px;background:#238636;color:#fff;border:0;border-rad
 ${error ? `<div class="err">${esc(error)}</div>` : ''}
 <form method="POST" action="/authorize">
 <input type="hidden" name="client_id" value="${esc(clientId)}"><input type="hidden" name="redirect_uri" value="${esc(redirectUri)}"><input type="hidden" name="state" value="${esc(state)}">
-<input name="email" type="email" placeholder="email" required autofocus>
-<input name="password" type="password" placeholder="пароль" required>
-<button type="submit">Увійти</button></form></div></body></html>`;
+<input name="email" type="email" placeholder="email" required autofocus autocomplete="username">
+<input name="password" type="password" placeholder="пароль" required autocomplete="current-password">
+<button type="submit">Увійти</button></form>
+<div style="text-align:center;margin-top:14px"><a href="/forgot-password" style="color:#8b949e;font-size:13px;text-decoration:underline">Забули пароль?</a></div>
+</div></body></html>`;
+}
+
+// Обгортка сторінки SSO (спільний стиль)
+function ssoPage(title: string, inner: string): string {
+  return `<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
+<style>body{font-family:system-ui;background:#0d1117;color:#e6edf3;display:flex;min-height:100vh;align-items:center;justify-content:center}
+.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;width:340px}
+h1{font-size:18px;margin:0 0 4px}p{color:#8b949e;font-size:13px;margin:0 0 20px}
+input{width:100%;box-sizing:border-box;padding:10px;margin-bottom:12px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3}
+button{width:100%;padding:11px;background:#238636;color:#fff;border:0;border-radius:8px;font-weight:600;cursor:pointer}
+.msg{font-size:13px;margin:12px 0}.ok{color:#3fb950}.err{color:#f85149}a{color:#58a6ff}</style></head>
+<body><div class="card">${inner}</div></body></html>`;
+}
+
+// Сторінка «Забули пароль?» — вводимо email, шлемо на POST /forgot-password.
+function forgotPage(): string {
+  return ssoPage('FINEKO — відновлення пароля', `<h1>🔐 Відновлення пароля</h1><p>Введіть email — надішлемо посилання для скидання.</p>
+<input id="email" type="email" placeholder="email" autocomplete="username" autofocus>
+<button onclick="go()">Надіслати посилання</button>
+<div id="msg" class="msg"></div>
+<div style="text-align:center;margin-top:10px"><a href="javascript:history.back()">← Назад до входу</a></div>
+<script>
+async function go(){var e=document.getElementById('email').value.trim();var m=document.getElementById('msg');
+if(!e){m.className='msg err';m.textContent='Введіть email';return;}
+m.className='msg';m.textContent='Надсилаю…';
+try{var r=await fetch('/forgot-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e})});var d=await r.json();
+m.className='msg ok';m.innerHTML=(d.message||'Якщо акаунт існує, ми надіслали посилання.')+(d.devLink?'<br><br>Локальне посилання:<br><a href="'+d.devLink+'">'+d.devLink+'</a>':'');
+}catch(_){m.className='msg err';m.textContent='Помилка. Спробуйте пізніше.';}}
+</script>`);
+}
+
+// Сторінка скидання пароля за токеном.
+function resetPage(token: string): string {
+  const t = token.replace(/[^a-f0-9]/gi, '');
+  return ssoPage('FINEKO — новий пароль', `<h1>🔐 Новий пароль</h1><p>Введіть новий пароль до акаунта FINEKO.</p>
+<input id="pw" type="password" placeholder="новий пароль (мін. 6)" autocomplete="new-password" autofocus>
+<button onclick="go()">Зберегти пароль</button>
+<div id="msg" class="msg"></div>
+<script>
+async function go(){var p=document.getElementById('pw').value;var m=document.getElementById('msg');
+if(!p||p.length<6){m.className='msg err';m.textContent='Пароль мінімум 6 символів';return;}
+m.className='msg';m.textContent='Зберігаю…';
+try{var r=await fetch('/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:'${t}',password:p})});var d=await r.json();
+if(r.ok){m.className='msg ok';m.innerHTML='✅ '+(d.message||'Пароль оновлено.')+'<br><br><a href="/">Повернутись</a>';}
+else{m.className='msg err';m.textContent=d.error||'Не вдалося оновити.';}
+}catch(_){m.className='msg err';m.textContent='Помилка. Спробуйте пізніше.';}}
+</script>`);
 }
 
 // Захист: жоден необроблений reject/exception не має класти сервіс
