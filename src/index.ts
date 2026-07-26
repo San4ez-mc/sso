@@ -51,6 +51,11 @@ app.get('/health', async (_req, res) => {
   res.json({ ok: true, service: 'fineko-sso', users });
 });
 
+// Favicon (брендований F)
+app.get('/favicon.svg', (_req, res) => {
+  res.type('image/svg+xml').send('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#e0364f"/><stop offset="1" stop-color="#8b1e3f"/></linearGradient></defs><rect width="64" height="64" rx="14" fill="#0b0f1a"/><text x="32" y="46" font-family="Arial,Helvetica,sans-serif" font-size="42" font-weight="800" fill="url(#g)" text-anchor="middle">F</text></svg>');
+});
+
 // ── Реєстрація (email+пароль) ───────────────────────────────
 app.post('/register', async (req: Request, res: Response) => {
   try {
@@ -165,7 +170,7 @@ app.get('/authorize', async (req: Request, res: Response) => {
     const clientId = String(req.query.client_id || '');
     const redirectUri = String(req.query.redirect_uri || '');
     const state = String(req.query.state || '');
-    if (!clientId) return void res.status(400).send('client_id required');
+    if (!clientId) return void res.type('html').send(ssoPage('FINEKO — Єдиний вхід', `<h1>🔐 FINEKO SSO</h1><p>Єдиний вхід у продукти FINEKO. Ця сторінка відкривається автоматично, коли ви входите з продукту. Оберіть систему:</p><div style="display:flex;flex-direction:column;gap:10px;margin-top:8px"><a href="https://org.fineko.space" style="color:#e0364f">→ Орг.структура</a><a href="https://content2.fineko.space" style="color:#e0364f">→ Контент</a><a href="https://tasks2.fineko.space" style="color:#e0364f">→ Трекер</a></div>`));
     const client = await prisma.oAuthClient.findUnique({ where: { clientId } });
     if (!client) return void res.status(400).send('Unknown client_id');
     const allowed: string[] = JSON.parse(client.redirectUris || '[]');
@@ -273,9 +278,9 @@ app.post('/admin/clients', async (req: Request, res: Response) => {
 
 function loginPage(clientId: string, redirectUri: string, state: string, error: string): string {
   const esc = (s: string) => s.replace(/"/g, '&quot;').replace(/</g, '&lt;');
-  return `<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FINEKO — вхід</title>
-<style>body{font-family:system-ui;background:#0d1117;color:#e6edf3;display:flex;min-height:100vh;align-items:center;justify-content:center}
-.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;width:340px}
+  return `<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FINEKO — вхід</title><link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>body{font-family:system-ui;background:linear-gradient(rgba(13,17,23,.5),rgba(13,17,23,.82)),url('/login-bg.png') center/cover fixed,#0d1117;color:#e6edf3;display:flex;min-height:100vh;align-items:center;justify-content:center}
+.card{background:rgba(22,27,34,.82);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:32px;width:340px;box-shadow:0 24px 70px rgba(0,0,0,.5)}
 h1{font-size:18px;margin:0 0 4px}p{color:#8b949e;font-size:13px;margin:0 0 20px}
 input{width:100%;box-sizing:border-box;padding:10px;margin-bottom:12px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3}
 button{width:100%;padding:11px;background:#238636;color:#fff;border:0;border-radius:8px;font-weight:600;cursor:pointer}
@@ -293,9 +298,9 @@ ${error ? `<div class="err">${esc(error)}</div>` : ''}
 
 // Обгортка сторінки SSO (спільний стиль)
 function ssoPage(title: string, inner: string): string {
-  return `<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
-<style>body{font-family:system-ui;background:#0d1117;color:#e6edf3;display:flex;min-height:100vh;align-items:center;justify-content:center}
-.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;width:340px}
+  return `<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>body{font-family:system-ui;background:linear-gradient(rgba(13,17,23,.5),rgba(13,17,23,.82)),url('/login-bg.png') center/cover fixed,#0d1117;color:#e6edf3;display:flex;min-height:100vh;align-items:center;justify-content:center}
+.card{background:rgba(22,27,34,.82);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:32px;width:340px;box-shadow:0 24px 70px rgba(0,0,0,.5)}
 h1{font-size:18px;margin:0 0 4px}p{color:#8b949e;font-size:13px;margin:0 0 20px}
 input{width:100%;box-sizing:border-box;padding:10px;margin-bottom:12px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3}
 button{width:100%;padding:11px;background:#238636;color:#fff;border:0;border-radius:8px;font-weight:600;cursor:pointer}
