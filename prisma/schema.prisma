@@ -19,8 +19,27 @@ model User {
 
   identities  Identity[]
   resetTokens PasswordResetToken[]
+  access      Access[]
 
   @@map("users")
+}
+
+// Доступи користувача до продукту (роль + дозволені проєкти). Керується у «Компанії».
+// Продукт (напр. flows) читає це через /oauth/permissions і застосовує RBAC.
+model Access {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product    String // 'flows' | 'content' | 'org' | ...
+  role       String   @default("user") // superadmin | user
+  projectIds String   @default("[]") // JSON-масив дозволених project id (для role=user)
+  pageIds    String   @default("[]") // JSON-масив дозволених сторінок/пунктів меню (для role=user); [] = усі базові (не superadminOnly)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([userId, product])
+  @@index([userId])
+  @@map("access")
 }
 
 // Кілька способів входу на одного User (мердж за email)
