@@ -45,6 +45,72 @@ async function currentUser(req: Request) {
   return prisma.user.findUnique({ where: { id: p.sub } });
 }
 
+// ── Куки ────────────────────────────────────────────────────
+// secure вмикається автоматично на https, щоб локальна розробка по http не зламалась.
+const SECURE_COOKIES = BASE_URL.startsWith('https://');
+const SESSION_COOKIE = { httpOnly: true, sameSite: 'lax' as const, secure: SECURE_COOKIES, maxAge: TOKEN_TTL * 1000 };
+
+// ── Вхід в адмінку: одноразовий квиток → окрема коротка сесія ──────────
+// Навіщо окремо від sso_token: звичайна сесія живе 30 днів і ходить у продукти.
+// Панель доступів бачить геть усе, тому вимагає свіжого підтвердження — це
+// step-up. Токен у посиланні одноразовий і живе хвилини: він обмінюється на
+// куку і зникає з адресного рядка, щоб не осісти в історії чи логах.
+const ADMIN_TICKET_TTL = 180; // 3 хв на перехід за посиланням
+const ADMIN_SESSION_TTL = 30 * 60; // 30 хв роботи в панелі
+const usedTickets = new Map<string, number>(); // jti → коли протух
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [jti, exp] of usedTickets) if (exp < now) usedTickets.delete(jti);
+}, 60_000).unref();
+
+function issueAdminTicket(userId: string): string {
+  return jwt.sign({ sub: userId, typ: 'admin_ticket', jti: randomUUID() }, JWT_SECRET, { expiresIn: ADMIN_TICKET_TTL });
+}
+
+/** Перевіряє квиток і одразу гасить його — повторний перехід за тим самим посиланням не спрацює. */
+function consumeAdminTicket(token: string): string | null {
+  let p: any;
+  try { p = jwt.verify(token, JWT_SECRET); } catch { return null; }
+  if (p.typ !== 'admin_ticket' || !p.sub || !p.jti) return null;
+  if (usedTickets.has(p.jti)) return null;
+  usedTickets.set(p.jti, Date.now() + ADMIN_TICKET_TTL * 1000);
+  return String(p.sub);
+}
+
+function issueAdminSession(userId: string): string {
+  return jwt.sign({ sub: userId, typ: 'admin' }, JWT_SECRET, { expiresIn: ADMIN_SESSION_TTL });
+}
+
+/**
+ * Доступ до панелі: свіжа адмін-сесія І чинні права ЗАРАЗ.
+ * Права перечитуються з БД щоразу — відкликання діє негайно, а не через 30 хв.
+ */
+async function requireAdminSession(req: Request) {
+  const raw = String(req.cookies?.admin_session || '');
+  if (!raw) return null;
+  let p: any;
+  try { p = jwt.verify(raw, JWT_SECRET); } catch { return null; }
+  if (p.typ !== 'admin' || !p.sub) return null;
+
+  const user = await prisma.user.findUnique({ where: { id: String(p.sub) } });
+  if (!user || user.status !== 'active') return null;
+  if (OWNER_EMAILS.includes((user.email || '').toLowerCase())) return user;
+  const sup = await prisma.access.findFirst({ where: { userId: user.id, role: 'superadmin' } });
+  return sup ? user : null;
+}
+
+/**
+ * Панель — тільки з власного походження. CORS у сервісі навмисне широкий
+ * (продукти ходять з різних доменів), тож для адмінських шляхів звужуємо окремо:
+ * інакше сторонній сайт міг би прочитати список користувачів кукою відвідувача.
+ */
+app.use('/admin', (req: Request, res: Response, next) => {
+  const origin = req.header('origin');
+  if (origin && origin !== BASE_URL) return void res.status(403).json({ error: 'cross-origin заборонено' });
+  next();
+});
+
 // ── Health ──────────────────────────────────────────────────
 app.get('/health', async (_req, res) => {
   const users = await prisma.user.count().catch(() => -1);
@@ -71,7 +137,7 @@ app.post('/register', async (req: Request, res: Response) => {
       data: { email, passwordHash, displayName, identities: { create: { provider: 'password', providerUserId: email, email } } },
     });
     const token = issueToken(user);
-    res.cookie('sso_token', token, { httpOnly: true, sameSite: 'lax', maxAge: TOKEN_TTL * 1000 });
+    res.cookie('sso_token', token, SESSION_COOKIE);
     res.json({ user: { id: user.id, email: user.email, displayName: user.displayName }, token });
   } catch (err) {
     res.status(500).json({ error: String(err) });
@@ -90,7 +156,7 @@ app.post('/login', async (req: Request, res: Response) => {
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return void res.status(401).json({ error: 'Невірний email або пароль' });
     const token = issueToken(user);
-    res.cookie('sso_token', token, { httpOnly: true, sameSite: 'lax', maxAge: TOKEN_TTL * 1000 });
+    res.cookie('sso_token', token, SESSION_COOKIE);
     res.json({ user: { id: user.id, email: user.email, displayName: user.displayName }, token });
   } catch (err) {
     res.status(500).json({ error: String(err) });
@@ -99,6 +165,7 @@ app.post('/login', async (req: Request, res: Response) => {
 
 app.post('/logout', (_req, res) => {
   res.cookie('sso_token', '', { httpOnly: true, maxAge: 0 });
+  res.cookie('admin_session', '', { httpOnly: true, maxAge: 0 });
   res.json({ ok: true });
 });
 
@@ -202,7 +269,7 @@ app.post('/authorize', async (req: Request, res: Response) => {
       return void res.type('html').send(loginPage(clientId, redirectUri, state, 'Невірний email або пароль'));
     }
     const token = issueToken(user);
-    res.cookie('sso_token', token, { httpOnly: true, sameSite: 'lax', maxAge: TOKEN_TTL * 1000 });
+    res.cookie('sso_token', token, SESSION_COOKIE);
     const code = randomBytes(24).toString('hex');
     await prisma.authCode.create({ data: { code, clientId, userId: user.id, redirectUri, expiresAt: new Date(Date.now() + 300_000) } });
     const sep = redirectUri.includes('?') ? '&' : '?';
@@ -440,7 +507,7 @@ async function requireOwnerUI(req: Request) {
 // Уся картина доступів: користувачі × продукти + каталоги. Одним запитом,
 // щоб панель не робила N викликів і не мигала.
 app.get('/admin/overview', async (req: Request, res: Response) => {
-  const me = await requireOwnerUI(req);
+  const me = await requireAdminSession(req);
   if (!me) return void res.status(401).json({ error: 'unauthorized' });
 
   const [users, accesses, catalogs] = await Promise.all([
@@ -479,7 +546,7 @@ app.get('/admin/overview', async (req: Request, res: Response) => {
 // Зміна доступу з панелі. Окремо від /admin/access (той під x-admin-key для скриптів),
 // бо тут авторизація кукою живої людини.
 app.put('/admin/overview/access', async (req: Request, res: Response) => {
-  const me = await requireOwnerUI(req);
+  const me = await requireAdminSession(req);
   if (!me) return void res.status(401).json({ error: 'unauthorized' });
 
   const { userId, product, role, projectIds, pageIds } = req.body || {};
@@ -550,7 +617,44 @@ app.put('/companies/access', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-app.get('/admin', (_req: Request, res: Response) => void res.type('html').send(adminPage()));
+// Видача одноразового посилання в панель. Доступна власнику/суперадміну
+// за звичайною сесією — саме тут відбувається перехід «я залогінений» → «я в адмінці».
+app.post('/admin/ticket', async (req: Request, res: Response) => {
+  const me = await requireOwnerUI(req);
+  if (!me) return void res.status(401).json({ error: 'unauthorized' });
+  res.json({ url: `${BASE_URL}/admin/enter?t=${issueAdminTicket(me.id)}`, ttlSeconds: ADMIN_TICKET_TTL });
+});
+
+// Обмін квитка на коротку адмін-сесію. Токен гаситься, і ми одразу редіректимо
+// на чистий /admin — щоб він не лишився в історії браузера.
+app.get('/admin/enter', async (req: Request, res: Response) => {
+  const userId = consumeAdminTicket(String(req.query.t || ''));
+  if (!userId) return void res.status(410).type('html').send(ssoPage('Посилання недійсне',
+    '<h1>Посилання вже використане або протухло</h1><p>Поверніться на <a href="/" style="color:#e0364f">головну SSO</a> і отримайте нове.</p>'));
+
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user || user.status !== 'active') return void res.status(403).send('Доступ закрито');
+  const isOwner = OWNER_EMAILS.includes((user.email || '').toLowerCase());
+  const sup = isOwner ? true : !!(await prisma.access.findFirst({ where: { userId, role: 'superadmin' } }));
+  if (!sup) return void res.status(403).send('Потрібні права адміністратора');
+
+  res.cookie('admin_session', issueAdminSession(userId), {
+    httpOnly: true, sameSite: 'strict', secure: SECURE_COOKIES, maxAge: ADMIN_SESSION_TTL * 1000, path: '/admin',
+  });
+  res.redirect('/admin');
+});
+
+// Саму сторінку теж ховаємо: без адмін-сесії її наче й немає.
+app.get('/admin', async (req: Request, res: Response) => {
+  const me = await requireAdminSession(req);
+  if (!me) return void res.status(404).send('Cannot GET /admin');
+  res.type('html').send(adminPage());
+});
+
+app.post('/admin/exit', (_req: Request, res: Response) => {
+  res.cookie('admin_session', '', { httpOnly: true, maxAge: 0, path: '/admin' });
+  res.json({ ok: true });
+});
 app.get('/companies', (_req: Request, res: Response) => void res.type('html').send(companiesPage()));
 
 function loginPage(clientId: string, redirectUri: string, state: string, error: string): string {
@@ -740,7 +844,13 @@ select{width:100%}
 button{background:#238636;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer}
 .chk{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .chk label{display:flex;align-items:center;gap:5px;background:#161b22;border:1px solid #30363d;border-radius:7px;padding:4px 8px;font-size:12px;cursor:pointer}
+.ent{border:1px solid #21262d;border-radius:8px;padding:8px;margin-top:8px;background:rgba(0,0,0,.18)}
+.ent-h{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:11px;color:#8b949e;margin-bottom:6px}
+.ent-h b{color:#c9d1d9;font-weight:600}
+.ent-a{font-size:11px;color:#58a6ff;cursor:pointer;text-decoration:underline}
+.ent-empty{font-size:11px;color:#6e7681;font-style:italic}
 .sect{font-size:11px;color:#8b949e;margin-top:8px}
+.exit{background:none;border:1px solid #30363d;color:#8b949e;border-radius:8px;padding:7px 12px;font-size:12px;cursor:pointer}
 #msg{font-size:13px;margin:8px 0;min-height:18px}
 .login{max-width:340px;margin:60px auto}
 .badge{font-size:11px;border-radius:6px;padding:2px 7px;border:1px solid #30363d}
@@ -750,6 +860,7 @@ button{background:#238636;color:#fff;border:0;border-radius:8px;padding:8px 14px
 <h1>Доступи до продуктів FINEKO</h1>
 <p class="sub">Усі користувачі й усі продукти в одному місці. Проєкти та сторінки читаються з самих сервісів, тож список не треба підтримувати вручну.</p>
 <div class="top" id="top"></div>
+<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px"><span class="muted">Сесія панелі коротка — коли протухне, візьміть нове разове посилання на головній SSO.</span><button class="exit" id="exitBtn">Вийти з панелі</button></div>
 <input id="q" placeholder="пошук за email або імʼям" style="width:100%;box-sizing:border-box;margin-bottom:12px">
 <div id="app">Завантаження…</div><div id="msg"></div>
 </div>
@@ -759,7 +870,7 @@ function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'
 
 async function load(){
   var r=await fetch('/admin/overview',{credentials:'include'});
-  if(r.status===401){renderLogin();return;}
+  if(r.status===401){location.href='/';return;}
   DATA=await r.json();
   renderTop();render();
 }
@@ -782,23 +893,32 @@ function badge(role){
 }
 function opt(v,cur,t){return '<option value="'+v+'"'+(cur===v?' selected':'')+'>'+t+'</option>';}
 
+// Кожна сутність — окремий блок із заголовком, лічильником і швидким вибором.
+// Так видно, що саме відкрито: проєкти і пункти меню це різні речі.
+function entity(id,title,cls,list,checked,labelField,emptyText){
+  if(!list.length) return '<div class="ent"><div class="ent-h"><b>'+esc(title)+'</b></div><div class="ent-empty">'+esc(emptyText)+'</div></div>';
+  var boxes=list.map(function(x){
+    var on=checked.indexOf(x.id)>=0;
+    return '<label><input type="checkbox" class="'+cls+'" data-k="'+esc(id)+'" value="'+esc(x.id)+'"'+(on?' checked':'')+'>'+esc(x[labelField])+'</label>';
+  }).join('');
+  var n=list.filter(function(x){return checked.indexOf(x.id)>=0;}).length;
+  return '<div class="ent"><div class="ent-h"><b>'+esc(title)+'</b>'+
+    '<span>'+n+' з '+list.length+' &nbsp;'+
+    '<span class="ent-a bulk" data-c="'+cls+'" data-k="'+esc(id)+'" data-v="1">усі</span> / '+
+    '<span class="ent-a bulk" data-c="'+cls+'" data-k="'+esc(id)+'" data-v="0">жодного</span></span></div>'+
+    '<div class="chk">'+boxes+'</div></div>';
+}
+
 function prodBlock(u,p){
   var a=u.access[p.key]||{role:'none',projectIds:[],pageIds:[]};
   var id=u.id+'--'+p.key;
   var warn=p.catalog.ok?'':'<span class="warn" title="'+esc(p.catalog.note||'')+'">каталог н/д</span>';
   var body='';
-  if(p.catalog.ok&&(p.catalog.projects.length||p.catalog.pages.length)){
-    var pr=p.catalog.projects.map(function(x){
-      var on=a.projectIds.indexOf(x.id)>=0;
-      return '<label><input type="checkbox" class="pchk" data-k="'+esc(id)+'" value="'+esc(x.id)+'"'+(on?' checked':'')+'>'+esc(x.name)+'</label>';
-    }).join('');
-    var pg=p.catalog.pages.map(function(x){
-      var on=a.pageIds.indexOf(x.id)>=0;
-      return '<label><input type="checkbox" class="gchk" data-k="'+esc(id)+'" value="'+esc(x.id)+'"'+(on?' checked':'')+'>'+esc(x.label)+'</label>';
-    }).join('');
+  if(p.catalog.ok){
     body='<div class="detail" id="d-'+esc(id)+'" style="'+(a.role==='user'?'':'display:none')+'">'+
-      (pr?'<div class="sect">Проєкти</div><div class="chk">'+pr+'</div>':'')+
-      (pg?'<div class="sect">Сторінки</div><div class="chk">'+pg+'</div>':'')+'</div>';
+      entity(id,'Проєкти','pchk',p.catalog.projects,a.projectIds,'name','Проєктів у цьому сервісі немає')+
+      entity(id,'Сторінки меню','gchk',p.catalog.pages,a.pageIds,'label','Сторінки не оголошені сервісом')+
+      '</div>';
   }
   return '<div class="prod"><h4><span>'+esc(p.label)+' '+badge(a.role)+'</span>'+warn+'</h4>'+
     '<select class="role" data-k="'+esc(id)+'">'+opt('none',a.role,'Немає доступу')+opt('user',a.role,'Користувач')+opt('superadmin',a.role,'Суперадмін')+'</select>'+
@@ -832,10 +952,14 @@ document.addEventListener('change',function(ev){
 });
 document.addEventListener('click',async function(ev){
   var t=ev.target;if(!t)return;
-  if(t.id==='loginBtn'){
-    var e=document.getElementById('e').value.trim(),p=document.getElementById('p').value;
-    var r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({email:e,password:p})});
-    if(r.ok){location.reload();}else{document.getElementById('le').textContent='Невірний email або пароль';}
+  if(t.classList&&t.classList.contains('bulk')){
+    var want=t.getAttribute('data-v')==='1';
+    document.querySelectorAll('.'+t.getAttribute('data-c')+'[data-k="'+t.getAttribute('data-k')+'"]').forEach(function(c){c.checked=want;});
+    return;
+  }
+  if(t.id==='exitBtn'){
+    await fetch('/admin/exit',{method:'POST',credentials:'include'});
+    location.href='/';
     return;
   }
   if(t.classList&&t.classList.contains('save')){
@@ -853,6 +977,129 @@ document.addEventListener('click',async function(ev){
     }
     if(okAll){m.style.color='#3fb950';m.textContent='Збережено о '+new Date().toLocaleTimeString();await load();}
     else{m.style.color='#f85149';m.textContent='Помилка: '+errText;}
+  }
+});
+load();
+</script></body></html>`;
+}
+
+// ── Головна SSO: вхід і перелік систем ──────────────────────
+// Посилання в продукти ведуть через /authorize: сесія вже є, тому SSO одразу
+// видає код і кидає всередину — окремий пароль ніде вводити не треба.
+app.get('/hub/data', async (req: Request, res: Response) => {
+  const user = await currentUser(req);
+  if (!user || user.status !== 'active') return void res.status(401).json({ error: 'unauthorized' });
+
+  const clients = await prisma.oAuthClient.findMany();
+  const byName = new Map(clients.map((c) => [c.name, c]));
+
+  const links = PRODUCTS.map((p) => {
+    const c = byName.get(p.key);
+    let redirect = '';
+    try { redirect = (JSON.parse(c?.redirectUris || '[]') as string[])[0] || ''; } catch { /* порожньо */ }
+    const ready = Boolean(c && redirect);
+    return {
+      key: p.key,
+      label: p.label,
+      ready,
+      url: ready ? `${BASE_URL}/authorize?client_id=${encodeURIComponent(c!.clientId)}&redirect_uri=${encodeURIComponent(redirect)}` : '',
+      note: !c ? 'не підключений до SSO' : (!redirect ? 'не заданий redirect_uri' : ''),
+    };
+  });
+
+  const isOwner = OWNER_EMAILS.includes((user.email || '').toLowerCase());
+  const sup = isOwner ? true : !!(await prisma.access.findFirst({ where: { userId: user.id, role: 'superadmin' } }));
+
+  res.json({ user: { email: user.email, displayName: user.displayName }, links, isAdmin: sup });
+});
+
+app.get('/', (_req: Request, res: Response) => void res.type('html').send(hubPage()));
+
+function hubPage(): string {
+  return `<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FINEKO — Єдиний вхід</title><link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+body{font-family:system-ui;margin:0;background:linear-gradient(rgba(13,17,23,.6),rgba(13,17,23,.9)),url('/login-bg.png') center/cover fixed,#0b0f1a;color:#e6edf3;min-height:100vh}
+.wrap{max-width:520px;margin:0 auto;padding:48px 16px}
+h1{font-size:22px;margin:0 0 4px}.sub{color:#8b949e;font-size:13px;margin:0 0 20px}
+.card{background:rgba(22,27,34,.85);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:16px;margin-bottom:12px}
+a.item,button.item{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;box-sizing:border-box;
+  background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:12px 14px;margin-bottom:8px;
+  color:#e6edf3;text-decoration:none;font-size:14px;font-weight:600;cursor:pointer;text-align:left}
+a.item:hover,button.item:hover{border-color:#58a6ff}
+a.item.off{opacity:.45;pointer-events:none}
+button.admin{background:linear-gradient(90deg,rgba(224,54,79,.18),rgba(224,54,79,.06));border-color:#e0364f;color:#ffd9df}
+button.admin:hover{border-color:#ff5470}
+.tag{font-size:11px;font-weight:500;color:#8b949e}
+.tag.hot{color:#ff9db0}
+input{background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;padding:10px;width:100%;box-sizing:border-box;margin-bottom:10px}
+button.go{background:#238636;color:#fff;border:0;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer;width:100%}
+.muted{color:#8b949e;font-size:12px}.err{color:#f85149;font-size:13px;margin-top:8px}
+.who{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:14px}
+.out{background:none;border:1px solid #30363d;color:#8b949e;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer}
+</style></head>
+<body><div class="wrap">
+<h1>FINEKO</h1>
+<p class="sub">Єдиний вхід у продукти екосистеми.</p>
+<div id="app" class="card">Завантаження…</div>
+</div>
+<script>
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');}
+
+async function load(){
+  var r=await fetch('/hub/data',{credentials:'include'});
+  if(r.status===401){renderLogin('');return;}
+  var d=await r.json();renderHub(d);
+}
+
+function renderLogin(err){
+  document.getElementById('app').innerHTML=
+    '<div style="font-size:16px;font-weight:600;margin-bottom:10px">Вхід</div>'+
+    '<input id="e" type="email" placeholder="email" autocomplete="username">'+
+    '<input id="p" type="password" placeholder="пароль" autocomplete="current-password">'+
+    '<button class="go" id="loginBtn">Увійти</button>'+
+    '<div class="err" id="le">'+esc(err)+'</div>'+
+    '<div style="text-align:center;margin-top:12px"><a href="/forgot-password" class="muted">Забули пароль?</a></div>';
+}
+
+function renderHub(d){
+  var items=d.links.map(function(l){
+    if(!l.ready) return '<a class="item off"><span>'+esc(l.label)+'</span><span class="tag">'+esc(l.note)+'</span></a>';
+    return '<a class="item" href="'+esc(l.url)+'"><span>'+esc(l.label)+'</span><span class="tag">увійти</span></a>';
+  }).join('');
+
+  var admin=d.isAdmin
+    ? '<button class="item admin" id="adminBtn"><span>Панель доступів</span><span class="tag hot">разове посилання, 3 хв</span></button>'
+    : '';
+
+  document.getElementById('app').innerHTML=
+    '<div class="who"><span class="muted">'+esc(d.user.displayName||d.user.email)+'</span>'+
+    '<button class="out" id="outBtn">Вийти</button></div>'+
+    items+
+    (admin?'<div style="height:6px"></div>'+admin:'')+
+    '<div id="ae" class="err"></div>';
+}
+
+document.addEventListener('click',async function(ev){
+  var t=ev.target.closest? ev.target.closest('button'):null;
+  if(!t)return;
+
+  if(t.id==='loginBtn'){
+    var e=document.getElementById('e').value.trim(),p=document.getElementById('p').value;
+    var r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({email:e,password:p})});
+    if(r.ok){load();}else{document.getElementById('le').textContent='Невірний email або пароль';}
+    return;
+  }
+  if(t.id==='outBtn'){
+    await fetch('/logout',{method:'POST',credentials:'include'});
+    location.reload();return;
+  }
+  if(t.id==='adminBtn'){
+    // Квиток беремо в момент кліку: він живе хвилини й спрацьовує один раз,
+    // тому не має сенсу тримати його в сторінці заздалегідь.
+    t.disabled=true;
+    var rr=await fetch('/admin/ticket',{method:'POST',credentials:'include'});
+    if(rr.ok){var j=await rr.json();location.href=j.url;}
+    else{t.disabled=false;document.getElementById('ae').textContent='Не вдалося отримати доступ до панелі';}
   }
 });
 load();
