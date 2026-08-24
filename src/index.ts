@@ -842,8 +842,10 @@ h1{font-size:22px;margin:0 0 4px}.sub{color:#8b949e;font-size:13px;margin:0 0 18
 select,input{background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;padding:7px;font-size:13px}
 select{width:100%}
 button{background:#238636;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer}
-.chk{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
-.chk label{display:flex;align-items:center;gap:5px;background:#161b22;border:1px solid #30363d;border-radius:7px;padding:4px 8px;font-size:12px;cursor:pointer}
+.chk{display:flex;flex-direction:column;gap:2px;margin-top:6px}
+.chk label{display:flex;align-items:center;gap:7px;padding:3px 2px;font-size:12.5px;cursor:pointer;color:#c9d1d9;border-radius:5px}
+.chk label:hover{background:rgba(255,255,255,.04)}
+.chk input{accent-color:#58a6ff;margin:0}
 .ent{border:1px solid #21262d;border-radius:8px;padding:8px;margin-top:8px;background:rgba(0,0,0,.18)}
 .ent-h{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:11px;color:#8b949e;margin-bottom:6px}
 .ent-h b{color:#c9d1d9;font-weight:600}
