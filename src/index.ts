@@ -373,6 +373,143 @@ async function fetchFlowsPages(): Promise<Array<{ id: string; label: string }>> 
   } catch { return []; }
 }
 
+// ── Реєстр продуктів екосистеми ─────────────────────────────
+// Ключ = значення Access.product І назва OAuthClient. Каталог (проєкти/сторінки)
+// читаємо з самого продукту тим самим контрактом, що вже працює для flows:
+//   GET <url>/api/auth/sso/projects  → { projects: [{id,name}] }
+//   GET <url>/api/auth/sso/pages     → { pages:    [{id,label}] }
+// Продукт, який ще не має цих ендпоінтів, не ламає панель — показуємо його
+// з роллю без деталізації і поміткою, що каталог недоступний.
+interface ProductDef { key: string; label: string; url: string }
+
+const PRODUCTS: ProductDef[] = [
+  { key: 'flows', label: 'Воронки', url: FLOWS_URL },
+  { key: 'org', label: 'Орг.структура', url: process.env.ORG_URL || 'https://org.fineko.space' },
+  { key: 'content2', label: 'Контент', url: process.env.CONTENT_URL || 'https://content2.fineko.space' },
+  { key: 'tracker', label: 'Трекер', url: process.env.TRACKER_URL || 'https://tasks2.fineko.space' },
+];
+
+interface Catalog {
+  projects: Array<{ id: string; name: string }>;
+  pages: Array<{ id: string; label: string }>;
+  ok: boolean;
+  note: string | null;
+}
+
+async function fetchCatalog(prod: ProductDef): Promise<Catalog> {
+  const empty = (note: string): Catalog => ({ projects: [], pages: [], ok: false, note });
+  const client = await prisma.oAuthClient.findFirst({ where: { name: prod.key } });
+  if (!client) return empty('OAuth-клієнт не зареєстрований у SSO');
+
+  const get = async (path: string) => {
+    const r = await fetch(`${prod.url}/api/auth/sso/${path}`, {
+      headers: { 'x-sso-secret': client.clientSecret },
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json() as any;
+  };
+
+  let projects: Array<{ id: string; name: string }> = [];
+  let pages: Array<{ id: string; label: string }> = [];
+  let note: string | null = null;
+  try {
+    const j = await get('projects');
+    projects = Array.isArray(j.projects) ? j.projects : [];
+  } catch (e: any) {
+    note = `проєкти недоступні (${e.message})`;
+  }
+  try {
+    const j = await get('pages');
+    pages = Array.isArray(j.pages) ? j.pages : [];
+  } catch (e: any) {
+    note = note ? `${note}; сторінки недоступні` : `сторінки недоступні (${e.message})`;
+  }
+  return { projects, pages, ok: note === null, note };
+}
+
+/** Панель доступів: власник або суперадмін БУДЬ-ЯКОГО продукту. */
+async function requireOwnerUI(req: Request) {
+  const user = await currentUser(req);
+  if (!user || user.status !== 'active') return null;
+  if (OWNER_EMAILS.includes((user.email || '').toLowerCase())) return user;
+  const any = await prisma.access.findFirst({ where: { userId: user.id, role: 'superadmin' } });
+  return any ? user : null;
+}
+
+// Уся картина доступів: користувачі × продукти + каталоги. Одним запитом,
+// щоб панель не робила N викликів і не мигала.
+app.get('/admin/overview', async (req: Request, res: Response) => {
+  const me = await requireOwnerUI(req);
+  if (!me) return void res.status(401).json({ error: 'unauthorized' });
+
+  const [users, accesses, catalogs] = await Promise.all([
+    prisma.user.findMany({ orderBy: { createdAt: 'desc' }, include: { identities: { select: { provider: true } } } }),
+    prisma.access.findMany(),
+    Promise.all(PRODUCTS.map((p) => fetchCatalog(p))),
+  ]);
+
+  const byUserProduct = new Map(accesses.map((a) => [`${a.userId}::${a.product}`, a]));
+  const parse = (v: string | null | undefined): string[] => {
+    try { return JSON.parse(v || '[]'); } catch { return []; }
+  };
+
+  res.json({
+    me: { email: me.email },
+    products: PRODUCTS.map((p, i) => ({ key: p.key, label: p.label, url: p.url, catalog: catalogs[i] })),
+    users: users.map((u) => ({
+      id: u.id,
+      email: u.email,
+      displayName: u.displayName,
+      status: u.status,
+      providers: u.identities.map((i) => i.provider),
+      createdAt: u.createdAt,
+      access: Object.fromEntries(PRODUCTS.map((p) => {
+        const a = byUserProduct.get(`${u.id}::${p.key}`);
+        return [p.key, {
+          role: a?.role || 'none',
+          projectIds: parse(a?.projectIds),
+          pageIds: parse(a?.pageIds),
+        }];
+      })),
+    })),
+  });
+});
+
+// Зміна доступу з панелі. Окремо від /admin/access (той під x-admin-key для скриптів),
+// бо тут авторизація кукою живої людини.
+app.put('/admin/overview/access', async (req: Request, res: Response) => {
+  const me = await requireOwnerUI(req);
+  if (!me) return void res.status(401).json({ error: 'unauthorized' });
+
+  const { userId, product, role, projectIds, pageIds } = req.body || {};
+  if (!userId || !PRODUCTS.some((p) => p.key === product)) {
+    return void res.status(422).json({ error: 'userId + відомий product обовʼязкові' });
+  }
+  if (!['superadmin', 'user', 'none'].includes(role)) {
+    return void res.status(422).json({ error: 'role: superadmin | user | none' });
+  }
+
+  // Захист від самоблокування: власник не має відібрати доступ сам у себе випадково.
+  if (userId === me.id && role === 'none') {
+    return void res.status(409).json({ error: 'Не можна прибрати доступ самому собі' });
+  }
+
+  if (role === 'none') {
+    await prisma.access.deleteMany({ where: { userId, product } });
+    return void res.json({ ok: true, removed: true });
+  }
+
+  const pj = JSON.stringify(Array.isArray(projectIds) ? projectIds : []);
+  const pg = JSON.stringify(Array.isArray(pageIds) ? pageIds : []);
+  await prisma.access.upsert({
+    where: { userId_product: { userId, product } },
+    update: { role, projectIds: pj, pageIds: pg },
+    create: { userId, product, role, projectIds: pj, pageIds: pg },
+  });
+  res.json({ ok: true });
+});
+
 app.get('/companies/data', async (req: Request, res: Response) => {
   const admin = await flowsSuperadmin(req);
   if (!admin) return void res.status(401).json({ error: 'unauthorized' });
@@ -413,6 +550,7 @@ app.put('/companies/access', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+app.get('/admin', (_req: Request, res: Response) => void res.type('html').send(adminPage()));
 app.get('/companies', (_req: Request, res: Response) => void res.type('html').send(companiesPage()));
 
 function loginPage(clientId: string, redirectUri: string, state: string, error: string): string {
@@ -577,3 +715,146 @@ app.listen(PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`[fineko-sso] listening on ${BASE_URL}`);
 });
+
+// ── Панель доступів (усі продукти) ──────────────────────────
+// Свідомо без фреймворків і збірки: SSO — маленький сервіс, і його панель
+// має відкриватись навіть тоді, коли решта екосистеми лежить.
+function adminPage(): string {
+  return `<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FINEKO — Доступи</title><link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+body{font-family:system-ui;margin:0;background:linear-gradient(rgba(13,17,23,.6),rgba(13,17,23,.9)),url('/login-bg.png') center/cover fixed,#0b0f1a;color:#e6edf3;min-height:100vh}
+.wrap{max-width:1180px;margin:0 auto;padding:24px 16px}
+h1{font-size:22px;margin:0 0 4px}.sub{color:#8b949e;font-size:13px;margin:0 0 18px}
+.card{background:rgba(22,27,34,.85);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:16px;margin-bottom:12px}
+.top{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+.pill{background:rgba(22,27,34,.85);border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:6px 12px;font-size:12px}
+.pill b{color:#e6edf3}.pill.off{opacity:.55}
+.uhead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+.email{font-weight:600}.muted{color:#8b949e;font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}
+.prod{background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:10px}
+.prod h4{margin:0 0 8px;font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.warn{color:#d29922;font-size:11px;font-weight:400;cursor:help}
+select,input{background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;padding:7px;font-size:13px}
+select{width:100%}
+button{background:#238636;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer}
+.chk{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chk label{display:flex;align-items:center;gap:5px;background:#161b22;border:1px solid #30363d;border-radius:7px;padding:4px 8px;font-size:12px;cursor:pointer}
+.sect{font-size:11px;color:#8b949e;margin-top:8px}
+#msg{font-size:13px;margin:8px 0;min-height:18px}
+.login{max-width:340px;margin:60px auto}
+.badge{font-size:11px;border-radius:6px;padding:2px 7px;border:1px solid #30363d}
+.b-none{color:#8b949e}.b-user{color:#58a6ff;border-color:#1f6feb}.b-super{color:#f0883e;border-color:#9e6a03}
+</style></head>
+<body><div class="wrap">
+<h1>Доступи до продуктів FINEKO</h1>
+<p class="sub">Усі користувачі й усі продукти в одному місці. Проєкти та сторінки читаються з самих сервісів, тож список не треба підтримувати вручну.</p>
+<div class="top" id="top"></div>
+<input id="q" placeholder="пошук за email або імʼям" style="width:100%;box-sizing:border-box;margin-bottom:12px">
+<div id="app">Завантаження…</div><div id="msg"></div>
+</div>
+<script>
+var DATA=null;
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');}
+
+async function load(){
+  var r=await fetch('/admin/overview',{credentials:'include'});
+  if(r.status===401){renderLogin();return;}
+  DATA=await r.json();
+  renderTop();render();
+}
+function renderLogin(){
+  document.getElementById('top').innerHTML='';
+  document.getElementById('app').innerHTML='<div class="card login"><div style="font-size:18px;font-weight:600;margin-bottom:6px">Вхід</div><p class="sub">Потрібні права власника або суперадміна.</p><input id="e" type="email" placeholder="email" style="width:100%;box-sizing:border-box;margin-bottom:10px"><input id="p" type="password" placeholder="пароль" style="width:100%;box-sizing:border-box;margin-bottom:10px"><button id="loginBtn" style="width:100%">Увійти</button><div id="le" class="muted" style="margin-top:8px"></div></div>';
+}
+function renderTop(){
+  var html=DATA.products.map(function(p){
+    var n=DATA.users.filter(function(u){return u.access[p.key] && u.access[p.key].role!=='none';}).length;
+    var cat=p.catalog.ok?(p.catalog.projects.length+' проєктів, '+p.catalog.pages.length+' сторінок'):'каталог недоступний';
+    return '<span class="pill'+(p.catalog.ok?'':' off')+'"><b>'+esc(p.label)+'</b> — '+n+' з доступом, '+esc(cat)+'</span>';
+  }).join('');
+  document.getElementById('top').innerHTML=html+'<span class="pill">ви: <b>'+esc(DATA.me.email)+'</b></span>';
+}
+function badge(role){
+  if(role==='superadmin')return '<span class="badge b-super">суперадмін</span>';
+  if(role==='user')return '<span class="badge b-user">користувач</span>';
+  return '<span class="badge b-none">немає</span>';
+}
+function opt(v,cur,t){return '<option value="'+v+'"'+(cur===v?' selected':'')+'>'+t+'</option>';}
+
+function prodBlock(u,p){
+  var a=u.access[p.key]||{role:'none',projectIds:[],pageIds:[]};
+  var id=u.id+'--'+p.key;
+  var warn=p.catalog.ok?'':'<span class="warn" title="'+esc(p.catalog.note||'')+'">каталог н/д</span>';
+  var body='';
+  if(p.catalog.ok&&(p.catalog.projects.length||p.catalog.pages.length)){
+    var pr=p.catalog.projects.map(function(x){
+      var on=a.projectIds.indexOf(x.id)>=0;
+      return '<label><input type="checkbox" class="pchk" data-k="'+esc(id)+'" value="'+esc(x.id)+'"'+(on?' checked':'')+'>'+esc(x.name)+'</label>';
+    }).join('');
+    var pg=p.catalog.pages.map(function(x){
+      var on=a.pageIds.indexOf(x.id)>=0;
+      return '<label><input type="checkbox" class="gchk" data-k="'+esc(id)+'" value="'+esc(x.id)+'"'+(on?' checked':'')+'>'+esc(x.label)+'</label>';
+    }).join('');
+    body='<div class="detail" id="d-'+esc(id)+'" style="'+(a.role==='user'?'':'display:none')+'">'+
+      (pr?'<div class="sect">Проєкти</div><div class="chk">'+pr+'</div>':'')+
+      (pg?'<div class="sect">Сторінки</div><div class="chk">'+pg+'</div>':'')+'</div>';
+  }
+  return '<div class="prod"><h4><span>'+esc(p.label)+' '+badge(a.role)+'</span>'+warn+'</h4>'+
+    '<select class="role" data-k="'+esc(id)+'">'+opt('none',a.role,'Немає доступу')+opt('user',a.role,'Користувач')+opt('superadmin',a.role,'Суперадмін')+'</select>'+
+    body+'</div>';
+}
+
+function render(){
+  var q=(document.getElementById('q').value||'').trim().toLowerCase();
+  var users=DATA.users.filter(function(u){
+    if(!q)return true;
+    return (u.email||'').toLowerCase().indexOf(q)>=0||(u.displayName||'').toLowerCase().indexOf(q)>=0;
+  });
+  var html=users.map(function(u){
+    return '<div class="card"><div class="uhead">'+
+      '<span class="email">'+esc(u.displayName||u.email)+'</span>'+
+      '<span class="muted">'+esc(u.email)+' · '+esc(u.status)+' · '+esc((u.providers||[]).join(', ')||'без провайдера')+'</span>'+
+      '<span style="flex:1"></span>'+
+      '<button class="save" data-uid="'+esc(u.id)+'">Зберегти</button></div>'+
+      '<div class="grid">'+DATA.products.map(function(p){return prodBlock(u,p);}).join('')+'</div></div>';
+  }).join('');
+  document.getElementById('app').innerHTML=html||'<div class="card muted">Нікого не знайдено.</div>';
+}
+
+document.addEventListener('input',function(ev){if(ev.target&&ev.target.id==='q'&&DATA)render();});
+document.addEventListener('change',function(ev){
+  var t=ev.target;
+  if(t&&t.classList&&t.classList.contains('role')){
+    var d=document.getElementById('d-'+t.getAttribute('data-k'));
+    if(d)d.style.display=(t.value==='user')?'block':'none';
+  }
+});
+document.addEventListener('click',async function(ev){
+  var t=ev.target;if(!t)return;
+  if(t.id==='loginBtn'){
+    var e=document.getElementById('e').value.trim(),p=document.getElementById('p').value;
+    var r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({email:e,password:p})});
+    if(r.ok){location.reload();}else{document.getElementById('le').textContent='Невірний email або пароль';}
+    return;
+  }
+  if(t.classList&&t.classList.contains('save')){
+    var uid=t.getAttribute('data-uid');
+    var m=document.getElementById('msg');
+    var okAll=true,errText='';
+    for(var i=0;i<DATA.products.length;i++){
+      var pk=DATA.products[i].key,k=uid+'--'+pk;
+      var sel=document.querySelector('.role[data-k="'+k+'"]');if(!sel)continue;
+      var ids=[];document.querySelectorAll('.pchk[data-k="'+k+'"]:checked').forEach(function(c){ids.push(c.value);});
+      var gids=[];document.querySelectorAll('.gchk[data-k="'+k+'"]:checked').forEach(function(c){gids.push(c.value);});
+      var rr=await fetch('/admin/overview/access',{method:'PUT',headers:{'Content-Type':'application/json'},credentials:'include',
+        body:JSON.stringify({userId:uid,product:pk,role:sel.value,projectIds:ids,pageIds:gids})});
+      if(!rr.ok){okAll=false;var j=await rr.json().catch(function(){return {};});errText=j.error||('HTTP '+rr.status);}
+    }
+    if(okAll){m.style.color='#3fb950';m.textContent='Збережено о '+new Date().toLocaleTimeString();await load();}
+    else{m.style.color='#f85149';m.textContent='Помилка: '+errText;}
+  }
+});
+load();
+</script></body></html>`;
+}
