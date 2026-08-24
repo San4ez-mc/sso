@@ -447,13 +447,14 @@ async function fetchFlowsPages(): Promise<Array<{ id: string; label: string }>> 
 //   GET <url>/api/auth/sso/pages     → { pages:    [{id,label}] }
 // Продукт, який ще не має цих ендпоінтів, не ламає панель — показуємо його
 // з роллю без деталізації і поміткою, що каталог недоступний.
-interface ProductDef { key: string; label: string; url: string }
+interface ProductDef { key: string; label: string; url: string; webUrl: string }
 
 const PRODUCTS: ProductDef[] = [
-  { key: 'flows', label: 'Воронки', url: FLOWS_URL },
-  { key: 'org', label: 'Орг.структура', url: process.env.ORG_URL || 'https://org.fineko.space' },
-  { key: 'content2', label: 'Контент', url: process.env.CONTENT_URL || 'https://content2.fineko.space' },
-  { key: 'tracker', label: 'Трекер', url: process.env.TRACKER_URL || 'https://tasks2.fineko.space' },
+  { key: 'flows', label: 'Воронки', url: FLOWS_URL, webUrl: 'https://flows.fineko.space' },
+  // url — адреса API для каталогу (ORG слухає лише localhost), webUrl — куди відкривати людині.
+  { key: 'org', label: 'Орг.структура', url: process.env.ORG_URL || 'https://org.fineko.space', webUrl: 'https://org.fineko.space' },
+  { key: 'content2', label: 'Контент', url: process.env.CONTENT_URL || 'https://content2.fineko.space', webUrl: 'https://content2.fineko.space' },
+  { key: 'tracker', label: 'Трекер', url: process.env.TRACKER_URL || 'https://tasks2.fineko.space', webUrl: 'https://tasks2.fineko.space' },
 ];
 
 interface Catalog {
@@ -523,7 +524,7 @@ app.get('/admin/overview', async (req: Request, res: Response) => {
 
   res.json({
     me: { email: me.email },
-    products: PRODUCTS.map((p, i) => ({ key: p.key, label: p.label, url: p.url, catalog: catalogs[i] })),
+    products: PRODUCTS.map((p, i) => ({ key: p.key, label: p.label, url: p.webUrl, catalog: catalogs[i] })),
     users: users.map((u) => ({
       id: u.id,
       email: u.email,
@@ -739,12 +740,18 @@ button{background:#238636;color:#fff;border:0;border-radius:8px;padding:8px 14px
 .proj{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
 .proj label{display:flex;align-items:center;gap:6px;background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:6px 10px;font-size:13px;cursor:pointer}
 .muted{color:#8b949e;font-size:12px}#msg{font-size:13px;margin:8px 0;min-height:18px}
+.jump{position:sticky;bottom:0;margin-top:18px;padding:10px 12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;
+  background:rgba(13,17,23,.92);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.12);border-radius:12px}
+.jump b{font-size:12px;color:#8b949e;font-weight:500;margin-right:2px}
+.jump a{font-size:12.5px;font-weight:600;color:#e6edf3;text-decoration:none;padding:6px 12px;border:1px solid #30363d;border-radius:8px}
+.jump a:hover{border-color:#58a6ff;color:#58a6ff}
 .login{max-width:340px;margin:60px auto}
 </style></head>
 <body><div class="wrap">
 <h1>🏢 Компанії — доступи до Воронок</h1>
 <p class="sub">Признач роль і проєкти кожному користувачу. Доступи одразу читаються Воронками при вході.</p>
 <div id="app">Завантаження…</div><div id="msg"></div>
+<div class="jump" id="jump"></div>
 </div>
 <script>
 var PROJECTS=[];var PAGES=[];
@@ -887,6 +894,10 @@ function renderTop(){
     return '<span class="pill'+(p.catalog.ok?'':' off')+'"><b>'+esc(p.label)+'</b> — '+n+' з доступом, '+esc(cat)+'</span>';
   }).join('');
   document.getElementById('top').innerHTML=html+'<span class="pill">ви: <b>'+esc(DATA.me.email)+'</b></span>';
+  // Змінив доступи — одразу перевір у самому сервісі, не шукаючи адресу.
+  document.getElementById('jump').innerHTML='<b>Перейти:</b>'+
+    DATA.products.map(function(p){return '<a href="'+esc(p.url)+'" target="_blank" rel="noopener">'+esc(p.label)+'</a>';}).join('')+
+    '<a href="/" style="margin-left:auto">Головна SSO</a>';
 }
 function badge(role){
   if(role==='superadmin')return '<span class="badge b-super">суперадмін</span>';
