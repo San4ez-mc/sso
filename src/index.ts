@@ -496,6 +496,41 @@ async function fetchCatalog(prod: ProductDef): Promise<Catalog> {
   return { projects, pages, ok: note === null, note };
 }
 
+interface OrgPerson {
+  memberId: string;
+  companyId: string;
+  companyName: string;
+  name: string;
+  email: string | null;
+  telegramUsername: string | null;
+  ssoUserId: string | null;
+  positions: string[];
+  managerMemberId: string | null;
+}
+
+/**
+ * Люди з орг-платформи: посади й привʼязка до акаунтів SSO.
+ * Компанії — хребет усієї моделі, а посади живуть в ORG і дублювати їх тут не треба.
+ * Якщо ORG недоступний — панель показує користувачів без компаній, а не падає.
+ */
+async function fetchOrgPeople(): Promise<OrgPerson[]> {
+  const prod = PRODUCTS.find((x) => x.key === 'org');
+  if (!prod) return [];
+  const client = await prisma.oAuthClient.findFirst({ where: { name: 'org' } });
+  if (!client) return [];
+  try {
+    const r = await fetch(`${prod.url}/api/auth/sso/people`, {
+      headers: { 'x-sso-secret': client.clientSecret },
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!r.ok) return [];
+    const j: any = await r.json();
+    return Array.isArray(j.people) ? j.people : [];
+  } catch {
+    return [];
+  }
+}
+
 /** Панель доступів: власник або суперадмін БУДЬ-ЯКОГО продукту. */
 async function requireOwnerUI(req: Request) {
   const user = await currentUser(req);
@@ -511,11 +546,30 @@ app.get('/admin/overview', async (req: Request, res: Response) => {
   const me = await requireAdminSession(req);
   if (!me) return void res.status(401).json({ error: 'unauthorized' });
 
-  const [users, accesses, catalogs] = await Promise.all([
+  const [users, accesses, catalogs, people] = await Promise.all([
     prisma.user.findMany({ orderBy: { createdAt: 'desc' }, include: { identities: { select: { provider: true } } } }),
     prisma.access.findMany(),
     Promise.all(PRODUCTS.map((p) => fetchCatalog(p))),
+    fetchOrgPeople(),
   ]);
+
+  // Один акаунт може працювати в кількох компаніях — тому масив, а не одне значення.
+  const orgByUser = new Map<string, OrgPerson[]>();
+  for (const person of people) {
+    if (!person.ssoUserId) continue;
+    const list = orgByUser.get(person.ssoUserId) || [];
+    list.push(person);
+    orgByUser.set(person.ssoUserId, list);
+  }
+
+  const companies = new Map<string, { id: string; name: string; peopleTotal: number; linked: number }>();
+  for (const person of people) {
+    const row = companies.get(person.companyId)
+      || { id: person.companyId, name: person.companyName, peopleTotal: 0, linked: 0 };
+    row.peopleTotal += 1;
+    if (person.ssoUserId) row.linked += 1;
+    companies.set(person.companyId, row);
+  }
 
   const byUserProduct = new Map(accesses.map((a) => [`${a.userId}::${a.product}`, a]));
   const parse = (v: string | null | undefined): string[] => {
@@ -525,6 +579,12 @@ app.get('/admin/overview', async (req: Request, res: Response) => {
   res.json({
     me: { email: me.email },
     products: PRODUCTS.map((p, i) => ({ key: p.key, label: p.label, url: p.webUrl, catalog: catalogs[i] })),
+    companies: [...companies.values()].sort((a, b) => a.name.localeCompare(b.name, 'uk')),
+    // Люди, ще не привʼязані до акаунтів — щоб було видно, кого залишилось звести.
+    unlinked: people.filter((x) => !x.ssoUserId).map((x) => ({
+      memberId: x.memberId, companyId: x.companyId, name: x.name,
+      telegramUsername: x.telegramUsername, positions: x.positions,
+    })),
     users: users.map((u) => ({
       id: u.id,
       email: u.email,
@@ -532,6 +592,10 @@ app.get('/admin/overview', async (req: Request, res: Response) => {
       status: u.status,
       providers: u.identities.map((i) => i.provider),
       createdAt: u.createdAt,
+      org: (orgByUser.get(u.id) || []).map((x) => ({
+        companyId: x.companyId, companyName: x.companyName,
+        positions: x.positions, memberId: x.memberId,
+      })),
       access: Object.fromEntries(PRODUCTS.map((p) => {
         const a = byUserProduct.get(`${u.id}::${p.key}`);
         return [p.key, {
@@ -646,6 +710,34 @@ app.get('/admin/enter', async (req: Request, res: Response) => {
 });
 
 // Саму сторінку теж ховаємо: без адмін-сесії її наче й немає.
+// Звʼязати акаунт SSO з людиною в орг-платформі. Автоматично зіставити нікого:
+// в ORG у людей заповнений telegram, у SSO — пошта, спільного ключа немає.
+app.post('/admin/overview/link', async (req: Request, res: Response) => {
+  const me = await requireAdminSession(req);
+  if (!me) return void res.status(401).json({ error: 'unauthorized' });
+
+  const { memberId, ssoUserId } = req.body || {};
+  if (!memberId) return void res.status(422).json({ error: 'memberId обовʼязковий' });
+
+  const prod = PRODUCTS.find((x) => x.key === 'org');
+  const client = await prisma.oAuthClient.findFirst({ where: { name: 'org' } });
+  if (!prod || !client) return void res.status(503).json({ error: 'Орг-платформа не підключена' });
+
+  try {
+    const r = await fetch(`${prod.url}/api/auth/sso/link`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-sso-secret': client.clientSecret },
+      body: JSON.stringify({ memberId, ssoUserId: ssoUserId || null }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const j: any = await r.json().catch(() => ({}));
+    if (!r.ok) return void res.status(r.status).json({ error: j.error || `HTTP ${r.status}` });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(502).json({ error: `Орг-платформа недоступна: ${(e as Error).message}` });
+  }
+});
+
 app.get('/admin', async (req: Request, res: Response) => {
   const me = await requireAdminSession(req);
   if (!me) return void res.status(404).send('Cannot GET /admin');
@@ -860,6 +952,23 @@ button{background:#238636;color:#fff;border:0;border-radius:8px;padding:8px 14px
 .ent-empty{font-size:11px;color:#6e7681;font-style:italic}
 .sect{font-size:11px;color:#8b949e;margin-top:8px}
 .exit{background:none;border:1px solid #30363d;color:#8b949e;border-radius:8px;padding:7px 12px;font-size:12px;cursor:pointer}
+.co{border:1px solid rgba(255,255,255,.10);border-radius:12px;margin-bottom:10px;background:rgba(22,27,34,.85);overflow:hidden}
+.co-h{display:flex;align-items:center;gap:10px;padding:13px 15px;cursor:pointer;user-select:none}
+.co-h:hover{background:rgba(255,255,255,.03)}
+.co-h .nm{font-weight:600;font-size:14px}
+.co-h .meta{color:#8b949e;font-size:12px}
+.co-b{padding:0 15px 12px;border-top:1px solid rgba(255,255,255,.07)}
+.pr{border-bottom:1px solid rgba(255,255,255,.05)}
+.pr:last-child{border-bottom:0}
+.pr-h{display:flex;align-items:center;gap:10px;padding:10px 2px;cursor:pointer;flex-wrap:wrap}
+.pr-h:hover{background:rgba(255,255,255,.03)}
+.pos{font-size:11.5px;color:#a5d6ff}
+.way{font-size:10.5px;border:1px solid #30363d;border-radius:5px;padding:1px 6px;color:#8b949e}
+.way.on{color:#7ee787;border-color:#2ea043}
+.sum{font-size:11px;color:#8b949e;margin-left:auto}
+.unl{margin-top:10px;padding:9px 11px;border:1px dashed #30363d;border-radius:9px;font-size:12px;color:#8b949e}
+.unl select{margin-left:8px;max-width:260px}
+.caret{color:#8b949e;width:12px;display:inline-block}
 #msg{font-size:13px;margin:8px 0;min-height:18px}
 .login{max-width:340px;margin:60px auto}
 .badge{font-size:11px;border-radius:6px;padding:2px 7px;border:1px solid #30363d}
@@ -938,21 +1047,97 @@ function prodBlock(u,p){
     body+'</div>';
 }
 
+function loginWays(u){
+  var provs=(u.providers||[]);
+  var has=function(p){return provs.indexOf(p)>=0;};
+  return '<span class="way'+(has('password')?' on':'')+'">пароль</span>'+
+         '<span class="way'+(has('google')?' on':'')+'">Google</span>';
+}
+
+function accessSummary(u){
+  var parts=DATA.products.filter(function(p){
+    var a=u.access[p.key]; return a && a.role!=='none';
+  }).map(function(p){
+    var a=u.access[p.key];
+    return esc(p.label)+': '+(a.role==='superadmin'?'суперадмін':'користувач');
+  });
+  return parts.length? parts.join(' · ') : 'доступів немає';
+}
+
+function personRow(u){
+  var org=(u.org||[]);
+  var pos=org.map(function(o){return o.positions.join(', ');}).filter(Boolean).join(' · ');
+  return '<div class="pr">'+
+    '<div class="pr-h" data-person="'+esc(u.id)+'">'+
+      '<span class="caret" id="pc-'+esc(u.id)+'">▸</span>'+
+      '<span style="font-weight:600;font-size:13px">'+esc(u.displayName||u.email)+'</span>'+
+      '<span class="muted">'+esc(u.email)+'</span>'+
+      (pos?'<span class="pos">'+esc(pos)+'</span>':'<span class="pos" style="color:#8b949e">посаду не вказано</span>')+
+      loginWays(u)+
+      '<span class="sum">'+accessSummary(u)+'</span>'+
+      '<button class="save" data-uid="'+esc(u.id)+'">Зберегти</button>'+
+    '</div>'+
+    '<div id="pb-'+esc(u.id)+'" style="display:none;padding:0 0 12px 22px">'+
+      '<div class="grid">'+DATA.products.map(function(p){return prodBlock(u,p);}).join('')+'</div>'+
+    '</div></div>';
+}
+
+function renderCompanies(users){
+  var byCompany={}, noCompany=[];
+  users.forEach(function(u){
+    var org=(u.org||[]);
+    if(!org.length){ noCompany.push(u); return; }
+    org.forEach(function(o){
+      (byCompany[o.companyId]=byCompany[o.companyId]||{name:o.companyName,users:[]}).users.push(u);
+    });
+  });
+
+  // Компанії з ORG, у яких ще нікого не привʼязано, теж показуємо — інакше
+  // незрозуміло, чому компанія є в системі, а в панелі її немає.
+  (DATA.companies||[]).forEach(function(c){
+    if(!byCompany[c.id]) byCompany[c.id]={name:c.name,users:[]};
+    byCompany[c.id].total=c.peopleTotal;
+  });
+
+  var html=Object.keys(byCompany).map(function(cid){
+    var c=byCompany[cid];
+    var unl=(DATA.unlinked||[]).filter(function(x){return x.companyId===cid;});
+    return '<div class="co">'+
+      '<div class="co-h" data-co="'+esc(cid)+'">'+
+        '<span class="caret" id="cc-'+esc(cid)+'">▸</span>'+
+        '<span class="nm">'+esc(c.name)+'</span>'+
+        '<span class="meta">'+c.users.length+' з акаунтом'+
+          (c.total?' · '+c.total+' людей в орг-структурі':'')+
+          (unl.length?' · '+unl.length+' не привʼязано':'')+'</span>'+
+      '</div>'+
+      '<div class="co-b" id="cb-'+esc(cid)+'" style="display:none">'+
+        (c.users.length? c.users.map(personRow).join('') : '<div class="muted" style="padding:10px 0">Нікого з акаунтом SSO.</div>')+
+        (unl.length? '<div class="unl">Люди в орг-структурі без акаунта: '+
+            unl.map(function(x){return esc(x.name)+(x.telegramUsername?' (@'+esc(x.telegramUsername)+')':'');}).join(', ')+
+            '<div style="margin-top:7px">Привʼязати '+
+              '<select id="ul-m-'+esc(cid)+'">'+unl.map(function(x){return '<option value="'+esc(x.memberId)+'">'+esc(x.name)+'</option>';}).join('')+'</select>'+
+              ' до акаунта '+
+              '<select id="ul-u-'+esc(cid)+'">'+users.map(function(u){return '<option value="'+esc(u.id)+'">'+esc(u.displayName||u.email)+'</option>';}).join('')+'</select>'+
+              ' <button class="linkbtn" data-co="'+esc(cid)+'">Привʼязати</button>'+
+            '</div></div>' : '')+
+      '</div></div>';
+  }).join('');
+
+  if(noCompany.length){
+    html+='<div class="co"><div class="co-h" data-co="__none"><span class="caret" id="cc-__none">▸</span>'+
+      '<span class="nm">Поза компаніями</span><span class="meta">'+noCompany.length+'</span></div>'+
+      '<div class="co-b" id="cb-__none" style="display:none">'+noCompany.map(personRow).join('')+'</div></div>';
+  }
+  return html;
+}
+
 function render(){
   var q=(document.getElementById('q').value||'').trim().toLowerCase();
   var users=DATA.users.filter(function(u){
     if(!q)return true;
     return (u.email||'').toLowerCase().indexOf(q)>=0||(u.displayName||'').toLowerCase().indexOf(q)>=0;
   });
-  var html=users.map(function(u){
-    return '<div class="card"><div class="uhead">'+
-      '<span class="email">'+esc(u.displayName||u.email)+'</span>'+
-      '<span class="muted">'+esc(u.email)+' · '+esc(u.status)+' · '+esc((u.providers||[]).join(', ')||'без провайдера')+'</span>'+
-      '<span style="flex:1"></span>'+
-      '<button class="save" data-uid="'+esc(u.id)+'">Зберегти</button></div>'+
-      '<div class="grid">'+DATA.products.map(function(p){return prodBlock(u,p);}).join('')+'</div></div>';
-  }).join('');
-  document.getElementById('app').innerHTML=html||'<div class="card muted">Нікого не знайдено.</div>';
+  document.getElementById('app').innerHTML=renderCompanies(users)||'<div class="card muted">Нікого не знайдено.</div>';
 }
 
 document.addEventListener('input',function(ev){if(ev.target&&ev.target.id==='q'&&DATA)render();});
@@ -963,9 +1148,39 @@ document.addEventListener('change',function(ev){
     if(d)d.style.display=(t.value==='user')?'block':'none';
   }
 });
+function toggle(bodyId, caretId){
+  var b=document.getElementById(bodyId), c=document.getElementById(caretId);
+  if(!b)return;
+  var open=b.style.display==='none';
+  b.style.display=open?'block':'none';
+  if(c)c.textContent=open?'▾':'▸';
+}
+
 document.addEventListener('click',async function(ev){
   var t=ev.target;if(!t)return;
+
+  var coh=t.closest&&t.closest('.co-h');
+  if(coh){ var cid=coh.getAttribute('data-co'); toggle('cb-'+cid,'cc-'+cid); return; }
+
+  var prh=t.closest&&t.closest('.pr-h');
+  if(prh && !(t.classList&&t.classList.contains('save'))){
+    var pid=prh.getAttribute('data-person'); toggle('pb-'+pid,'pc-'+pid); return;
+  }
+
+  if(t.classList&&t.classList.contains('linkbtn')){
+    var c2=t.getAttribute('data-co');
+    var m=document.getElementById('ul-m-'+c2).value;
+    var u2=document.getElementById('ul-u-'+c2).value;
+    var rr=await fetch('/admin/overview/link',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',
+      body:JSON.stringify({memberId:m,ssoUserId:u2})});
+    var msg=document.getElementById('msg');
+    if(rr.ok){msg.style.color='#3fb950';msg.textContent='Привʼязано';await load();}
+    else{var j=await rr.json().catch(function(){return{};});msg.style.color='#f85149';msg.textContent=j.error||'Не вдалося привʼязати';}
+    return;
+  }
+
   if(t.classList&&t.classList.contains('bulk')){
+
     var want=t.getAttribute('data-v')==='1';
     document.querySelectorAll('.'+t.getAttribute('data-c')+'[data-k="'+t.getAttribute('data-k')+'"]').forEach(function(c){c.checked=want;});
     return;
