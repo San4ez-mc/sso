@@ -1,3 +1,8 @@
 node_modules
 .env
 dist
+
+# секрети: жодних ключів у репозиторії
+*.env
+!.env.example
+client_secret_*.json
