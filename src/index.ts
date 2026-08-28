@@ -323,15 +323,173 @@ app.post('/oauth/permissions', async (req: Request, res: Response) => {
   }
 });
 
-// ── Google OAuth (потрібні GOOGLE_CLIENT_ID/SECRET) ─────────
-app.get('/auth/google', (req: Request, res: Response) => {
+// ── Google OAuth ─────────────────────────────
+// Ключі: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET.
+// Необовʼязкові: GOOGLE_ALLOW_SIGNUP=1 (дозволити створення нових користувачів),
+// GOOGLE_ALLOWED_DOMAIN=fineko.space (пускати лише пошту цього домену).
+
+const GOOGLE_REDIRECT = `${BASE_URL}/auth/google/callback`;
+
+/** Кука живе лише похід до Google і назад — довше їй триматись ні для чого. */
+const OAUTH_FLOW_COOKIE = {
+  httpOnly: true, sameSite: 'lax' as const, secure: SECURE_COOKIES, maxAge: 600_000, path: '/auth/google',
+};
+
+/** Помилка входу — людською мовою, без технічних деталей. */
+function googleError(res: Response, message: string, status = 400) {
+  res.status(status).type('html').send(ssoPage('FINEKO — вхід через Google',
+    `<h1>🔐 Вхід не вдався</h1><p>${message.replace(/</g, '&lt;')}</p><a href="/">← На головну</a>`));
+}
+
+app.get('/auth/google', async (req: Request, res: Response) => {
   const cid = process.env.GOOGLE_CLIENT_ID;
-  if (!cid) return void res.status(501).json({ error: 'Google вхід не налаштовано (GOOGLE_CLIENT_ID)' });
-  const redirect = `${BASE_URL}/auth/google/callback`;
-  const params = new URLSearchParams({ client_id: cid, redirect_uri: redirect, response_type: 'code', scope: 'openid email profile', state: String(req.query.state || '') });
+  if (!cid || !process.env.GOOGLE_CLIENT_SECRET) {
+    return void googleError(res, 'Вхід через Google ще не налаштований.', 501);
+  }
+
+  const clientId = String(req.query.client_id || '');
+  const redirectUri = String(req.query.redirect_uri || '');
+
+  // Та сама перевірка, що й у GET /authorize. Без неї чужий сайт міг би підставити
+  // свій redirect_uri і зібрати авторизаційний код на себе.
+  if (clientId) {
+    const client = await prisma.oAuthClient.findUnique({ where: { clientId } });
+    if (!client) return void googleError(res, 'Невідомий продукт (client_id).');
+    const allowed: string[] = JSON.parse(client.redirectUris || '[]');
+    if (allowed.length && !allowed.includes(redirectUri)) {
+      return void googleError(res, 'Адреса повернення не дозволена для цього продукту.');
+    }
+  }
+
+  // state йде в URL і в куці одночасно; на поверненні звіряємо — це захист від CSRF.
+  const nonce = randomBytes(16).toString('hex');
+  res.cookie('g_flow', JSON.stringify({
+    nonce, clientId, redirectUri, productState: String(req.query.state || ''),
+  }), OAUTH_FLOW_COOKIE);
+
+  const params = new URLSearchParams({
+    client_id: cid,
+    redirect_uri: GOOGLE_REDIRECT,
+    response_type: 'code',
+    scope: 'openid email profile',
+    state: nonce,
+    prompt: 'select_account',
+  });
   res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
 });
-// callback — обмін коду, мердж за email, видача токена (спрощено; повний обмін — коли будуть креди)
+
+/**
+ * id_token прийшов напряму з token-ендпоінта Google по TLS у відповідь на запит
+ * із нашим client_secret. Це той самий випадок, де OIDC §3.1.3.7 дозволяє не перевіряти
+ * підпис: канал уже автентифікований. Змістові поля все одно звіряємо нижче.
+ */
+function decodeIdToken(idToken: string): Record<string, any> | null {
+  const parts = String(idToken || '').split('.');
+  if (parts.length !== 3) return null;
+  try {
+    return JSON.parse(Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+app.get('/auth/google/callback', async (req: Request, res: Response) => {
+  try {
+    const cid = process.env.GOOGLE_CLIENT_ID;
+    const secret = process.env.GOOGLE_CLIENT_SECRET;
+    if (!cid || !secret) return void googleError(res, 'Вхід через Google ще не налаштований.', 501);
+    if (req.query.error) return void googleError(res, 'Доступ не надано.');
+
+    let flow: any = null;
+    try { flow = JSON.parse(req.cookies?.g_flow || 'null'); } catch { flow = null; }
+    res.cookie('g_flow', '', { ...OAUTH_FLOW_COOKIE, maxAge: 0 });
+
+    if (!flow?.nonce || flow.nonce !== String(req.query.state || '')) {
+      return void googleError(res, 'Сесія входу не збігається або застаріла. Спробуй ще раз.');
+    }
+
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code: String(req.query.code || ''),
+        client_id: cid,
+        client_secret: secret,
+        redirect_uri: GOOGLE_REDIRECT,
+        grant_type: 'authorization_code',
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!tokenRes.ok) return void googleError(res, 'Google відхилив авторизацію. Спробуй ще раз.');
+
+    const claims = decodeIdToken((await tokenRes.json() as any).id_token);
+    if (!claims) return void googleError(res, 'Не вдалось прочитати відповідь Google.');
+
+    const issuerOk = ['https://accounts.google.com', 'accounts.google.com'].includes(String(claims.iss));
+    if (!issuerOk || claims.aud !== cid || Number(claims.exp) * 1000 < Date.now()) {
+      return void googleError(res, 'Підтвердження Google недійсне.');
+    }
+
+    // Привʼязка до наявного акаунта йде за email. Непідтверджена адреса означала б
+    // захоплення чужого акаунта за пару кліків, тому без email_verified не пускаємо ніколи.
+    if (claims.email_verified !== true && claims.email_verified !== 'true') {
+      return void googleError(res, 'Google не підтвердив цю пошту.');
+    }
+
+    const allowedDomain = (process.env.GOOGLE_ALLOWED_DOMAIN || '').trim().toLowerCase();
+    if (allowedDomain && String(claims.hd || '').toLowerCase() !== allowedDomain) {
+      return void googleError(res, `Вхід дозволений лише для пошти в домені ${allowedDomain}.`, 403);
+    }
+
+    const email = String(claims.email || '').trim().toLowerCase();
+    const sub = String(claims.sub || '');
+    if (!email || !sub) return void googleError(res, 'Google не повернув пошту.');
+
+    // 1) вже привʼязаний Google → 2) той самий email → 3) новий, якщо дозволено
+    const identity = await prisma.identity.findUnique({
+      where: { provider_providerUserId: { provider: 'google', providerUserId: sub } },
+      include: { user: true },
+    });
+    let user = identity?.user ?? await prisma.user.findUnique({ where: { email } });
+
+    if (user && !identity) {
+      await prisma.identity.create({ data: { userId: user.id, provider: 'google', providerUserId: sub, email } });
+    }
+
+    if (!user) {
+      // SSO — це точка керування доступами, тому самореєстрація вимкнена за замовчуванням:
+      // інакше будь-хто з Google-акаунтом завів би собі вхід у систему.
+      if (!process.env.GOOGLE_ALLOW_SIGNUP) {
+        return void googleError(res, `Акаунта для ${email} немає. Зверніться до адміністратора, щоб вас додали.`, 403);
+      }
+      user = await prisma.user.create({
+        data: {
+          email,
+          displayName: claims.name ? String(claims.name) : null,
+          identities: { create: { provider: 'google', providerUserId: sub, email } },
+        },
+      });
+    }
+
+    if (user.status !== 'active') return void googleError(res, 'Акаунт відключений.', 403);
+
+    res.cookie('sso_token', issueToken(user), SESSION_COOKIE);
+
+    // Прийшли з продукту — віддаємо код туди ж, як і парольний вхід.
+    if (flow.clientId && flow.redirectUri) {
+      const code = randomBytes(24).toString('hex');
+      await prisma.authCode.create({
+        data: { code, clientId: flow.clientId, userId: user.id, redirectUri: flow.redirectUri, expiresAt: new Date(Date.now() + 300_000) },
+      });
+      const sep = String(flow.redirectUri).includes('?') ? '&' : '?';
+      const st = flow.productState ? `&state=${encodeURIComponent(flow.productState)}` : '';
+      return void res.redirect(`${flow.redirectUri}${sep}code=${code}${st}`);
+    }
+    res.redirect('/');
+  } catch (err) {
+    googleError(res, 'Непередбачена помилка: ' + String(err), 500);
+  }
+});
 
 // ── Адмінка (для власника) ─────────────────────────────────
 function requireAdmin(req: Request, res: Response): boolean {
@@ -758,7 +916,11 @@ function loginPage(clientId: string, redirectUri: string, state: string, error: 
 h1{font-size:18px;margin:0 0 4px}p{color:#8b949e;font-size:13px;margin:0 0 20px}
 input{width:100%;box-sizing:border-box;padding:10px;margin-bottom:12px;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3}
 button{width:100%;padding:11px;background:#238636;color:#fff;border:0;border-radius:8px;font-weight:600;cursor:pointer}
-.err{color:#f85149;font-size:13px;margin-bottom:12px}</style></head>
+.err{color:#f85149;font-size:13px;margin-bottom:12px}
+.sep{display:flex;align-items:center;gap:10px;margin:16px 0;color:#8b949e;font-size:12px}
+.sep::before,.sep::after{content:"";flex:1;height:1px;background:#30363d}
+.gbtn{display:flex;align-items:center;justify-content:center;gap:9px;width:100%;box-sizing:border-box;padding:10px;background:#fff;color:#1f1f1f;border:1px solid #dadce0;border-radius:8px;font-weight:600;font-size:14px;text-decoration:none}
+.gbtn:hover{background:#f7f8f8}</style></head>
 <body><div class="card"><h1>🔐 FINEKO</h1><p>Єдиний вхід у продукти FINEKO</p>
 ${error ? `<div class="err">${esc(error)}</div>` : ''}
 <form method="POST" action="/authorize">
@@ -766,6 +928,10 @@ ${error ? `<div class="err">${esc(error)}</div>` : ''}
 <input name="email" type="email" placeholder="email" required autofocus autocomplete="username">
 <input name="password" type="password" placeholder="пароль" required autocomplete="current-password">
 <button type="submit">Увійти</button></form>
+<div class="sep"><span>або</span></div>
+<a class="gbtn" href="/auth/google?client_id=${encodeURIComponent(clientId)}&amp;redirect_uri=${encodeURIComponent(redirectUri)}&amp;state=${encodeURIComponent(state)}">
+<svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true"><path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h11.8c-.5 2.7-2 5-4.4 6.600v5.5h7.1c4.2-3.8 6.6-9.5 6.6-16.1z"/><path fill="#34A853" d="M24 46c6 0 11-2 14.6-5.4l-7.1-5.5c-2 1.3-4.5 2.1-7.5 2.1-5.8 0-10.6-3.9-12.4-9.1H4.3v5.7C7.9 41 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.6 28.1c-.5-1.3-.7-2.7-.7-4.1s.3-2.8.7-4.1v-5.7H4.3C2.8 17.1 2 20.4 2 24s.8 6.9 2.3 9.8l7.3-5.7z"/><path fill="#EA4335" d="M24 10.8c3.3 0 6.2 1.1 8.5 3.3l6.3-6.3C34.9 4.2 30 2 24 2 15.4 2 7.9 7 4.3 14.2l7.3 5.7c1.8-5.2 6.6-9.1 12.4-9.1z"/></svg>
+<span>Увійти через Google</span></a>
 <div style="text-align:center;margin-top:14px"><a href="/forgot-password" style="color:#8b949e;font-size:13px;text-decoration:underline">Забули пароль?</a></div>
 </div></body></html>`;
 }
