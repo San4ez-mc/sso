@@ -34,6 +34,7 @@ model Access {
   role       String   @default("user") // superadmin | user
   projectIds String   @default("[]") // JSON-масив дозволених project id (для role=user)
   pageIds    String   @default("[]") // JSON-масив дозволених сторінок/пунктів меню (для role=user); [] = усі базові (не superadminOnly)
+  canEdit    Boolean  @default(true) // false = лише перегляд (продукт сам вирішує, що саме заблокувати для редагування)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 

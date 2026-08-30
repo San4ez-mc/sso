@@ -312,12 +312,12 @@ app.post('/oauth/permissions', async (req: Request, res: Response) => {
     if (!client || client.clientSecret !== clientSecret) return void res.status(401).json({ error: 'invalid_client' });
     if (!userId || !product) return void res.status(400).json({ error: 'userId і product обовʼязкові' });
     const acc = await prisma.access.findUnique({ where: { userId_product: { userId, product: String(product) } } });
-    if (!acc) return void res.json({ role: 'none', projectIds: [], pageIds: [] });
+    if (!acc) return void res.json({ role: 'none', projectIds: [], pageIds: [], canEdit: true });
     let projectIds: string[] = [];
     try { projectIds = JSON.parse(acc.projectIds || '[]'); } catch { /* [] */ }
     let pageIds: string[] = [];
     try { pageIds = JSON.parse(acc.pageIds || '[]'); } catch { /* [] */ }
-    res.json({ role: acc.role, projectIds, pageIds });
+    res.json({ role: acc.role, projectIds, pageIds, canEdit: acc.canEdit });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
@@ -760,6 +760,7 @@ app.get('/admin/overview', async (req: Request, res: Response) => {
           role: a?.role || 'none',
           projectIds: parse(a?.projectIds),
           pageIds: parse(a?.pageIds),
+          canEdit: a?.canEdit ?? true,
         }];
       })),
     })),
@@ -772,7 +773,7 @@ app.put('/admin/overview/access', async (req: Request, res: Response) => {
   const me = await requireAdminSession(req);
   if (!me) return void res.status(401).json({ error: 'unauthorized' });
 
-  const { userId, product, role, projectIds, pageIds } = req.body || {};
+  const { userId, product, role, projectIds, pageIds, canEdit } = req.body || {};
   if (!userId || !PRODUCTS.some((p) => p.key === product)) {
     return void res.status(422).json({ error: 'userId + відомий product обовʼязкові' });
   }
@@ -792,10 +793,11 @@ app.put('/admin/overview/access', async (req: Request, res: Response) => {
 
   const pj = JSON.stringify(Array.isArray(projectIds) ? projectIds : []);
   const pg = JSON.stringify(Array.isArray(pageIds) ? pageIds : []);
+  const ce = canEdit !== false; // за замовчуванням true — щоб не зламати нікому доступ, хто цим не керує
   await prisma.access.upsert({
     where: { userId_product: { userId, product } },
-    update: { role, projectIds: pj, pageIds: pg },
-    create: { userId, product, role, projectIds: pj, pageIds: pg },
+    update: { role, projectIds: pj, pageIds: pg, canEdit: ce },
+    create: { userId, product, role, projectIds: pj, pageIds: pg, canEdit: ce },
   });
   res.json({ ok: true });
 });
@@ -1198,7 +1200,7 @@ function entity(id,title,cls,list,checked,labelField,emptyText){
 }
 
 function prodBlock(u,p){
-  var a=u.access[p.key]||{role:'none',projectIds:[],pageIds:[]};
+  var a=u.access[p.key]||{role:'none',projectIds:[],pageIds:[],canEdit:true};
   var id=u.id+'--'+p.key;
   var warn=p.catalog.ok?'':'<span class="warn" title="'+esc(p.catalog.note||'')+'">каталог н/д</span>';
   var body='';
@@ -1208,8 +1210,13 @@ function prodBlock(u,p){
       entity(id,'Сторінки меню','gchk',p.catalog.pages,a.pageIds,'label','Сторінки не оголошені сервісом')+
       '</div>';
   }
-  return '<div class="prod"><h4><span>'+esc(p.label)+' '+badge(a.role)+'</span>'+warn+'</h4>'+
+  // «Лише перегляд» — застосовність (що саме блокує редагування) вирішує сам продукт;
+  // для 'none'/'superadmin' пункт не показуємо — суперадмін завжди повний доступ, 'none' взагалі без доступу.
+  var editRow='<div id="ero-'+esc(id)+'" style="'+(a.role==='user'?'':'display:none')+'">'+
+    '<label class="viewonly"><input type="checkbox" class="readonly" data-k="'+esc(id)+'"'+(a.canEdit===false?' checked':'')+'> лише перегляд (без редагування)</label></div>';
+  return '<div class="prod"><h4><span>'+esc(p.label)+' '+badge(a.role)+(a.role==='user'&&a.canEdit===false?' <span class="badge" style="background:#3a2a00;color:#e3b341">лише перегляд</span>':'')+'</span>'+warn+'</h4>'+
     '<select class="role" data-k="'+esc(id)+'">'+opt('none',a.role,'Немає доступу')+opt('user',a.role,'Користувач')+opt('superadmin',a.role,'Суперадмін')+'</select>'+
+    editRow+
     body+'</div>';
 }
 
@@ -1225,7 +1232,8 @@ function accessSummary(u){
     var a=u.access[p.key]; return a && a.role!=='none';
   }).map(function(p){
     var a=u.access[p.key];
-    return esc(p.label)+': '+(a.role==='superadmin'?'суперадмін':'користувач');
+    var roleLabel=a.role==='superadmin'?'суперадмін':(a.canEdit===false?'користувач, лише перегляд':'користувач');
+    return esc(p.label)+': '+roleLabel;
   });
   return parts.length? parts.join(' · ') : 'доступів немає';
 }
@@ -1312,6 +1320,8 @@ document.addEventListener('change',function(ev){
   if(t&&t.classList&&t.classList.contains('role')){
     var d=document.getElementById('d-'+t.getAttribute('data-k'));
     if(d)d.style.display=(t.value==='user')?'block':'none';
+    var er=document.getElementById('ero-'+t.getAttribute('data-k'));
+    if(er)er.style.display=(t.value==='user')?'block':'none';
   }
 });
 function toggle(bodyId, caretId){
@@ -1365,8 +1375,10 @@ document.addEventListener('click',async function(ev){
       var sel=document.querySelector('.role[data-k="'+k+'"]');if(!sel)continue;
       var ids=[];document.querySelectorAll('.pchk[data-k="'+k+'"]:checked').forEach(function(c){ids.push(c.value);});
       var gids=[];document.querySelectorAll('.gchk[data-k="'+k+'"]:checked').forEach(function(c){gids.push(c.value);});
+      var ro=document.querySelector('.readonly[data-k="'+k+'"]');
+      var canEdit=ro?!ro.checked:true;
       var rr=await fetch('/admin/overview/access',{method:'PUT',headers:{'Content-Type':'application/json'},credentials:'include',
-        body:JSON.stringify({userId:uid,product:pk,role:sel.value,projectIds:ids,pageIds:gids})});
+        body:JSON.stringify({userId:uid,product:pk,role:sel.value,projectIds:ids,pageIds:gids,canEdit:canEdit})});
       if(!rr.ok){okAll=false;var j=await rr.json().catch(function(){return {};});errText=j.error||('HTTP '+rr.status);}
     }
     if(okAll){m.style.color='#3fb950';m.textContent='Збережено о '+new Date().toLocaleTimeString();await load();}
