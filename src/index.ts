@@ -613,6 +613,7 @@ const PRODUCTS: ProductDef[] = [
   { key: 'org', label: 'Орг.структура', url: process.env.ORG_URL || 'https://org.fineko.space', webUrl: 'https://org.fineko.space' },
   { key: 'content2', label: 'Контент', url: process.env.CONTENT_URL || 'https://content2.fineko.space', webUrl: 'https://content2.fineko.space' },
   { key: 'tracker', label: 'Трекер', url: process.env.TRACKER_URL || 'https://tasks2.fineko.space', webUrl: 'https://tasks2.fineko.space' },
+  { key: 'crm', label: 'Fineko CRM', url: process.env.CRM_URL || 'https://pcrm.fineko.space', webUrl: 'https://pcrm.fineko.space' },
 ];
 
 interface Catalog {
