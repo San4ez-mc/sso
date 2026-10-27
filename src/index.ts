@@ -6,7 +6,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { PrismaClient } from '@prisma/client';
-import { smtpEnabled, sendResetEmail } from './mailer';
+import { smtpEnabled, sendResetEmail, sendInviteEmail } from './mailer';
 
 const prisma = new PrismaClient();
 const app = express();
@@ -318,6 +318,73 @@ app.post('/oauth/permissions', async (req: Request, res: Response) => {
     let pageIds: string[] = [];
     try { pageIds = JSON.parse(acc.pageIds || '[]'); } catch { /* [] */ }
     res.json({ role: acc.role, projectIds, pageIds, canEdit: acc.canEdit });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ── Автоматичне створення доступу експерта (27.10) ─────────────────────────────
+// Викликає Flows після онбордингу ШІ-продавця: створює акаунт експерта й видає доступ ЛИШЕ до його проєктів.
+// Авторизація: секрет OAuth-клієнта flows (x-sso-secret). Вузьке коло дій навмисно: лише роль user, лише продукти flows і content2,
+// суперадмінів і чужі доступи не чіпає. Експерт отримує лист-запрошення зі встановленням пароля (7 днів).
+const PROVISION_PRODUCTS: Record<string, string> = { flows: 'Воронки (ваш ШІ-продавець, розмови, етапи)', content2: 'Контент (база знань вашого проєкту)' };
+const PROVISION_INVITE_TTL_MS = 7 * 24 * 3600_000;
+
+app.post('/oauth/provision-expert', async (req: Request, res: Response) => {
+  try {
+    const secret = String(req.header('x-sso-secret') || '');
+    const flowsClient = await prisma.oAuthClient.findFirst({ where: { name: 'flows' } });
+    if (!flowsClient || !secret || secret !== flowsClient.clientSecret) return void res.status(401).json({ error: 'unauthorized' });
+
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const displayName = String(req.body?.displayName || '').trim().slice(0, 120) || null;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return void res.status(422).json({ error: 'Некоректний email' });
+    const grants: Array<{ product: string; projectIds?: string[]; pageIds?: string[]; canEdit?: boolean }> = Array.isArray(req.body?.grants) ? req.body.grants : [];
+    if (!grants.length) return void res.status(422).json({ error: 'grants обовʼязкові' });
+    for (const g of grants) if (!PROVISION_PRODUCTS[String(g?.product)]) return void res.status(422).json({ error: 'Дозволені продукти: flows, content2' });
+
+    let user = await prisma.user.findUnique({ where: { email } });
+    const created = !user;
+    if (!user) user = await prisma.user.create({ data: { email, displayName, passwordHash: null } });
+    else if (user.status !== 'active') return void res.status(409).json({ error: 'Акаунт вимкнено' });
+
+    const granted: Array<{ product: string; projectIds: string[]; skipped?: string }> = [];
+    for (const g of grants) {
+      const product = String(g.product);
+      const ids = (Array.isArray(g.projectIds) ? g.projectIds : []).map(String).filter(Boolean);
+      const pages = (Array.isArray(g.pageIds) ? g.pageIds : []).map(String).filter(Boolean);
+      const cur = await prisma.access.findUnique({ where: { userId_product: { userId: user.id, product } } });
+      if (cur && cur.role === 'superadmin') { granted.push({ product, projectIds: [], skipped: 'суперадмін, не чіпаю' }); continue; }
+      const merge = (a: string, add: string[]) => { let old: string[] = []; try { old = JSON.parse(a || '[]'); } catch { /* [] */ } return JSON.stringify([...new Set([...old, ...add])]); };
+      const projectIds = merge(cur ? cur.projectIds : '[]', ids);
+      const pageIds = merge(cur ? cur.pageIds : '[]', pages);
+      await prisma.access.upsert({
+        where: { userId_product: { userId: user.id, product } },
+        update: { role: 'user', projectIds, pageIds },
+        create: { userId: user.id, product, role: 'user', projectIds, pageIds, canEdit: g.canEdit !== false },
+      });
+      granted.push({ product, projectIds: JSON.parse(projectIds) });
+    }
+
+    // Запрошення: лише новому акаунту без пароля й без входу через провайдера
+    const idents = await prisma.identity.count({ where: { userId: user.id } });
+    let invited = false; let mailed = false; let inviteLink: string | undefined;
+    // Свіже запрошення (до доби) не дублюємо: повторний виклик після онбордингу не має засипати експерта листами.
+    const fresh = await prisma.passwordResetToken.findFirst({ where: { userId: user.id, usedAt: null, expiresAt: { gt: new Date(Date.now() + PROVISION_INVITE_TTL_MS - 24 * 3600_000) } } });
+    if (!user.passwordHash && idents === 0 && !fresh) {
+      await prisma.passwordResetToken.deleteMany({ where: { userId: user.id, usedAt: null } });
+      const token = randomBytes(32).toString('hex');
+      await prisma.passwordResetToken.create({ data: { userId: user.id, token, expiresAt: new Date(Date.now() + PROVISION_INVITE_TTL_MS) } });
+      inviteLink = `${BASE_URL}/reset-password/${token}`;
+      invited = true;
+      if (smtpEnabled()) {
+        try { await sendInviteEmail(email, displayName || '', inviteLink, grants.map((g) => PROVISION_PRODUCTS[String(g.product)])); mailed = true; inviteLink = undefined; }
+        catch (e) { console.error('[sso provision-expert] SMTP помилка:', e); }
+      }
+    }
+    // eslint-disable-next-line no-console
+    console.log('[sso provision-expert]', email, created ? 'створено' : 'існує', granted.map((g) => g.product).join(','));
+    res.json({ ok: true, created, invited, mailed, userId: user.id, granted, ...(inviteLink ? { inviteLink } : {}) });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }

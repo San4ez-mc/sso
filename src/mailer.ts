@@ -49,3 +49,31 @@ export async function sendResetEmail(to: string, link: string): Promise<void> {
     html: resetHtml(link),
   });
 }
+
+function inviteHtml(name: string, link: string, products: string[]): string {
+  const list = products.map((p) => `<li>${p}</li>`).join('');
+  return `<!doctype html><html lang="uk"><body style="margin:0;background:#f4f5f7;font-family:Arial,Helvetica,sans-serif;color:#1a1a1a">
+  <div style="max-width:480px;margin:32px auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e6e8eb">
+    <div style="background:#111;padding:20px 28px;color:#fff;font-size:18px;font-weight:700">🔐 FINEKO</div>
+    <div style="padding:28px">
+      <h1 style="font-size:18px;margin:0 0 12px">${name ? name + ', у вас' : 'У вас'} є доступ до вашого ШІ-продавця</h1>
+      <p style="font-size:14px;line-height:1.5;color:#444;margin:0 0 12px">Ми створили для вас акаунт FINEKO. Вам доступно:</p>
+      <ul style="font-size:14px;color:#444;margin:0 0 20px;padding-left:20px">${list}</ul>
+      <a href="${link}" style="display:inline-block;background:#2563eb;color:#fff;text-decoration:none;padding:12px 22px;border-radius:8px;font-size:14px;font-weight:600">Встановити пароль і увійти</a>
+      <p style="font-size:12px;color:#888;margin:22px 0 0;word-break:break-all">Якщо кнопка не працює, скопіюйте посилання: ${link}</p>
+      <p style="font-size:12px;color:#888;margin:14px 0 0">Посилання дійсне 7 днів. Якщо ви не очікували цього листа, просто проігноруйте його.</p>
+    </div>
+  </div></body></html>`;
+}
+
+/** Лист-запрошення експерту: акаунт створено автоматично після онбордингу, потрібно лише встановити пароль. */
+export async function sendInviteEmail(to: string, name: string, link: string, products: string[]): Promise<void> {
+  await getTransporter().sendMail({
+    from: FROM(),
+    to,
+    subject: 'FINEKO — доступ до вашого ШІ-продавця',
+    text: `Для вас створено акаунт FINEKO. Доступно: ${products.join(', ')}.
+Встановіть пароль (посилання дійсне 7 днів): ${link}`,
+    html: inviteHtml(name, link, products),
+  });
+}
