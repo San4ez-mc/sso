@@ -323,6 +323,30 @@ app.post('/oauth/permissions', async (req: Request, res: Response) => {
   }
 });
 
+// Хто має доступ до проєкту продукту (31.10, Edits goverla: «Хто оформив» у CRM — випадаючий список усіх, хто має доступ до системи).
+// Server-to-server, client-authed. Продукт бачить ЛИШЕ своїх людей (client.name === product) і лише імена — без email/ролей.
+// У список входять активні акаунти з правом редагування, які бачать цей проєкт: superadmin (бачить усе) або projectIds містить projectId.
+app.post('/oauth/product-users', async (req: Request, res: Response) => {
+  try {
+    const { client_id: clientId, client_secret: clientSecret, product, projectId } = req.body || {};
+    const client = await prisma.oAuthClient.findUnique({ where: { clientId } });
+    if (!client || client.clientSecret !== clientSecret) return void res.status(401).json({ error: 'invalid_client' });
+    if (!product || !projectId) return void res.status(400).json({ error: 'product і projectId обовʼязкові' });
+    if (client.name !== String(product)) return void res.status(403).json({ error: 'Продукт може питати лише про своїх користувачів' });
+    const rows = await prisma.access.findMany({ where: { product: String(product), canEdit: true, user: { status: 'active' } }, include: { user: { select: { id: true, displayName: true, email: true } } } });
+    const users = rows
+      .filter((a) => {
+        if (a.role === 'superadmin') return true;
+        try { return (JSON.parse(a.projectIds || '[]') as string[]).includes(String(projectId)); } catch { return false; }
+      })
+      .map((a) => ({ id: a.user.id, name: (a.user.displayName || '').trim() || a.user.email.split('@')[0] }))
+      .sort((x, y) => x.name.localeCompare(y.name, 'uk'));
+    res.json({ users });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 // ── Автоматичне створення доступу експерта (27.10) ─────────────────────────────
 // Викликає Flows після онбордингу ШІ-продавця: створює акаунт експерта й видає доступ ЛИШЕ до його проєктів.
 // Авторизація: секрет OAuth-клієнта flows (x-sso-secret). Вузьке коло дій навмисно: лише роль user, лише продукти flows і content2,
