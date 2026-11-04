@@ -705,6 +705,7 @@ const PRODUCTS: ProductDef[] = [
   { key: 'content2', label: 'Контент', url: process.env.CONTENT_URL || 'https://content2.fineko.space', webUrl: 'https://content2.fineko.space' },
   { key: 'tracker', label: 'Трекер', url: process.env.TRACKER_URL || 'https://tasks2.fineko.space', webUrl: 'https://tasks2.fineko.space' },
   { key: 'crm', label: 'Fineko CRM', url: process.env.CRM_URL || 'https://pcrm.fineko.space', webUrl: 'https://pcrm.fineko.space' },
+  { key: 'calendar', label: 'Календар', url: process.env.CALENDAR_URL || 'https://calendar.fineko.space', webUrl: 'https://calendar.fineko.space' },
 ];
 
 interface Catalog {
