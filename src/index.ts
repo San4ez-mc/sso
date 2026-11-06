@@ -414,6 +414,63 @@ app.post('/oauth/provision-expert', async (req: Request, res: Response) => {
   }
 });
 
+// ── Доступ власнику нового магазину CRM після оплати (06.11) ───────────────────
+// Викликає сама CRM, коли людина оплатила тариф: створює акаунт (якщо його ще нема) і видає доступ ЛИШЕ до її нового магазину в продукті crm.
+// Авторизація: client_id/client_secret OAuth-клієнта з назвою «crm». Вузьке коло дій навмисно: лише продукт crm, лише роль user,
+// суперадміна не чіпає, чужі магазини не забирає (projectIds додається до наявних). Новому акаунту йде лист зі встановленням пароля.
+app.post('/oauth/provision-shop-owner', async (req: Request, res: Response) => {
+  try {
+    const { client_id: clientId, client_secret: clientSecret } = req.body || {};
+    const client = await prisma.oAuthClient.findUnique({ where: { clientId: String(clientId || '') } });
+    if (!client || client.clientSecret !== clientSecret || client.name !== 'crm') return void res.status(401).json({ error: 'invalid_client' });
+
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const displayName = String(req.body?.displayName || '').trim().slice(0, 120) || null;
+    const projectId = String(req.body?.projectId || '').trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return void res.status(422).json({ error: 'Некоректний email' });
+    if (!projectId) return void res.status(422).json({ error: 'projectId обовʼязковий' });
+
+    let user = await prisma.user.findUnique({ where: { email } });
+    const created = !user;
+    if (!user) user = await prisma.user.create({ data: { email, displayName, passwordHash: null } });
+    else if (user.status !== 'active') return void res.status(409).json({ error: 'Акаунт вимкнено' });
+
+    const cur = await prisma.access.findUnique({ where: { userId_product: { userId: user.id, product: 'crm' } } });
+    let skipped: string | undefined;
+    if (cur && cur.role === 'superadmin') skipped = 'суперадмін, доступ уже повний';
+    else {
+      let old: string[] = [];
+      try { old = JSON.parse(cur ? cur.projectIds : '[]'); } catch { /* [] */ }
+      const projectIds = JSON.stringify([...new Set([...old, projectId])]);
+      await prisma.access.upsert({
+        where: { userId_product: { userId: user.id, product: 'crm' } },
+        update: { role: 'user', projectIds },
+        create: { userId: user.id, product: 'crm', role: 'user', projectIds, pageIds: '[]', canEdit: true },
+      });
+    }
+
+    const idents = await prisma.identity.count({ where: { userId: user.id } });
+    let invited = false; let mailed = false; let inviteLink: string | undefined;
+    const fresh = await prisma.passwordResetToken.findFirst({ where: { userId: user.id, usedAt: null, expiresAt: { gt: new Date(Date.now() + PROVISION_INVITE_TTL_MS - 24 * 3600_000) } } });
+    if (!user.passwordHash && idents === 0 && !fresh) {
+      await prisma.passwordResetToken.deleteMany({ where: { userId: user.id, usedAt: null } });
+      const token = randomBytes(32).toString('hex');
+      await prisma.passwordResetToken.create({ data: { userId: user.id, token, expiresAt: new Date(Date.now() + PROVISION_INVITE_TTL_MS) } });
+      inviteLink = `${BASE_URL}/reset-password/${token}`;
+      invited = true;
+      if (smtpEnabled()) {
+        try { await sendInviteEmail(email, displayName || '', inviteLink, ['CRM (ваш магазин: замовлення, покупці, прибуток)']); mailed = true; inviteLink = undefined; }
+        catch (e) { console.error('[sso provision-shop-owner] SMTP помилка:', e); }
+      }
+    }
+    // eslint-disable-next-line no-console
+    console.log('[sso provision-shop-owner]', email, created ? 'створено' : 'існує', projectId, skipped || 'доступ видано');
+    res.json({ ok: true, created, invited, mailed, userId: user.id, ...(skipped ? { skipped } : {}), ...(inviteLink ? { inviteLink } : {}) });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 // ── Google OAuth ─────────────────────────────
 // Ключі: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET.
 // Необовʼязкові: GOOGLE_ALLOW_SIGNUP=1 (дозволити створення нових користувачів),
